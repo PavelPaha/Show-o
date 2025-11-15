@@ -9,35 +9,53 @@ mlflow:
 
 experiment:
     project: "moe-training"
-    name: "showo-vanilla-mmu"  # ✅ Изменили имя, так как MoE выключен
-    output_dir: "output/showo-vanilla-mmu"  # ✅ Новая директория
+    name: "showo-vanilla-mmu"
+    output_dir: "output/showo-vanilla-mmu"
     max_train_examples_t2i: 20000000
     max_train_examples_mmu: 40000000
     save_every: 3000
     eval_every: 2500
-    generate_every: 500
-    log_every: 200
+    generate_every: 20
+    log_every: 10
     log_grad_norm_every: 500
-    resume_from_checkpoint: false  # ✅ Не загружаем старый checkpoint с NaN
+    resume_from_checkpoint: false
 
 moe:
     enabled: true
-    num_experts: 8  
+    num_experts: 8
     top_k: 2
     count_layers_to_patch: 6
     save_only_moe_weights: false
+    learning_rate: null  
     activation_stats:
         collect_frequency: 5
 
-    temp_start: 10
-    temp_end: 0.01
-    temp_steps: 20000
-    balance_warmup_steps: 1000
-    balance_gamma: 0.999
-    modality_init_hardness: 1.0
-    modality_init_steps: 1000  # Увеличили с 1000 до 10000 для более длинного warmup
-    modality_init_hardness_min: 0.0  # Минимальное значение hardness (20% от начального)
-    use_gumbel: false  # Использовать Gumbel-Softmax для soft top-k routing
+    temp_fixed: null
+    temp_start: 20.0
+    temp_end: 0.5
+    temp_steps: 1000
+    balance_warmup_steps: 200  
+    balance_gamma: 0.992  
+    
+    use_modality_bias: false
+    use_domain_bias: true
+    modality_init_hardness: 0.0  
+    modality_init_steps: 1
+    modality_init_hardness_min: 0.0  
+    domain_init_hardness: 50.0
+    domain_init_steps: 1000
+    domain_init_hardness_min: 0.0
+    domain_to_expert_map:
+        vqav2_experiments: [0, 1, 2, 3]
+        textvqa_experiments: [4, 5, 6, 7]
+    use_gumbel: false
+    gate_capacity: [4.0, 4.0]
+    random_routing: false
+
+    noise_std: 0.01
+    log_gates: True
+    log_activations: True
+    log_frequency: True
 
 model:
     vq_model:
@@ -46,13 +64,13 @@ model:
 
     showo:
         load_from_showo: True
-        pretrained_model_path: "showlab/show-o-w-clip-vit"  # ✅ Используем модель для 256x256
+        pretrained_model_path: "showlab/show-o-w-clip-vit"
         w_clip_vit: True
         vocab_size: 58498
         llm_vocab_size: 50295
         llm_model_path: "microsoft/phi-1_5"
         codebook_size: 8192
-        num_vq_tokens: 256  # ✅ Для 256x256: 16x16 = 256 токенов
+        num_vq_tokens: 256
         num_new_special_tokens: 10
 
     gradient_checkpointing: True
@@ -60,29 +78,57 @@ model:
 dataset:
     gen_type: "imagenet1k"
     und_type: "llava_pretrain"
-    combined_loader_mode: "min_size"
+    combined_loader_mode: "max_size_cycle"
     add_system_prompt: False
+
+    use_vqav2: false
+    use_textvqa: false
+    use_textvqa_experiments: true  
+    use_vqav2_experiments: true
+    use_clevr: false
+    use_docvqa: false
+    use_kvasir: false
     params:
-        train_t2i_shards_path_or_url: "/home/jovyan/vasiliev/notebooks/Show-o/data/llava_pretrain/images" # dummy, не используется (coeff=0)
-        train_lm_shards_path_or_url: "/home/jovyan/vasiliev/notebooks/Show-o/data/llava_pretrain" # dummy, не используется (coeff=0)
+        train_t2i_shards_path_or_url: "/home/jovyan/vasiliev/notebooks/Show-o/data/llava_pretrain/images"
+        train_lm_shards_path_or_url: "/home/jovyan/vasiliev/notebooks/Show-o/data/llava_pretrain"
         validation_prompts_file: "validation_prompts/text2image_prompts.txt"
         num_workers: 8
         shuffle_buffer_size: 1000
         pin_memory: True
         persistent_workers: True
+
+        vqav2_data_file_path: "/home/jovyan/vasiliev/notebooks/Show-o/data/vqav2/train.json"
+        vqav2_image_root: "/home/jovyan/vasiliev/notebooks/Show-o/data/vqav2/images"
+
+        textvqa_data_file_path: "/home/jovyan/vasiliev/notebooks/Show-o/data/textvqa/train.json"
+        textvqa_image_root: "/home/jovyan/vasiliev/notebooks/Show-o/data/textvqa/images"
+
+        textvqa_experiments_data_file_path: "/home/jovyan/vasiliev/notebooks/Show-o/moe_experiments/data/textvqa/train.json"
+        textvqa_experiments_image_root: "/home/jovyan/vasiliev/notebooks/Show-o/moe_experiments/data/textvqa/images"
+
+        vqav2_experiments_data_file_path: "/home/jovyan/vasiliev/notebooks/Show-o/moe_experiments/data/vqav2/train.json"
+        vqav2_experiments_image_root: "/home/jovyan/vasiliev/notebooks/Show-o/moe_experiments/data/vqav2/images"
+
+        clevr_data_file_path: "/home/jovyan/vasiliev/notebooks/Show-o/moe_experiments/data/clevr/train.json"
+        clevr_image_root: "/home/jovyan/vasiliev/notebooks/Show-o/moe_experiments/data/clevr/images"
+
+        docvqa_data_file_path: "/home/jovyan/vasiliev/notebooks/Show-o/data/docvqa/train.json"
+        docvqa_image_root: "/home/jovyan/vasiliev/notebooks/Show-o/data/docvqa/images"
+        kvasir_data_file_path: "/home/jovyan/vasiliev/notebooks/Show-o/data/kvasir/train.json"
+        kvasir_image_root: "/home/jovyan/vasiliev/notebooks/Show-o/data/kvasir/images"
     preprocessing:
-        max_seq_length: 256  # ✅ Уменьшаем для стабильности
-        resolution: 256  # ✅ Сначала обучим на 256x256
+        max_seq_length: 256
+        resolution: 256
 
 optimizer:
     name: adamw
-    params: # default adamw params
-        learning_rate: 0.0001  # ✅ Увеличили для vanilla (без MoE)
-        moe_learning_rate: 0.00001  # отдельный lr для MoE слоев (пока не используется)
+    params:
+        learning_rate: 0.0001
+        moe_learning_rate: 0.00001
         scale_lr: False
         beta1: 0.9
         beta2: 0.999
-        weight_decay: 0.01
+        weight_decay: 0.1
         epsilon: 1e-8
 
 lr_scheduler:
@@ -94,9 +140,18 @@ lr_scheduler:
 training:
     gradient_accumulation_steps: 1
     noise_type: "mask"
-    batch_size_t2i: 8 
+
+    batch_size_t2i: 2
     batch_size_lm: 1
-    batch_size_mmu: 8
+    batch_size_mmu: 2
+    batch_size_vqav2: 2
+    batch_size_vqav2_experiments: 2
+    batch_size_textvqa: 2
+    batch_size_textvqa_experiments: 2
+    batch_size_clevr: 2
+    batch_size_docvqa: 2
+    batch_size_kvasir: 2
+
     mixed_precision: "bf16"
     enable_tf32: True
     seed: 10086
@@ -113,3 +168,5 @@ training:
     mmu_coeff: 1.0
 
     balance_coeff: 0.01
+    
+    profiler_enabled: True

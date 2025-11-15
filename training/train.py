@@ -1,44 +1,47 @@
 import os
-
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+import sys
+sys.path.insert(0, "/home/jovyan/vasiliev/notebooks/Show-o")
+
 import logging
 import time
 from pathlib import Path
 from typing import Union
 from utils import get_optimizer
 
-import numpy as np
-from PIL import Image
 from omegaconf import OmegaConf
 import mlflow
 from mlflow.tracking import MlflowClient
 import torch
 from tqdm import tqdm
-from lightning.pytorch.utilities import CombinedLoader
 
 from transformers import AutoTokenizer
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import DistributedType, set_seed
+from accelerate.utils import (
+    DistributedType,
+    DistributedDataParallelKwargs,
+    # ProfileKwargs,
+    set_seed
+)
 
-import sys
-
-sys.path.insert(0, "/home/jovyan/vasiliev/notebooks/Show-o")
 
 import mlflow
 from mlflow.tracking import MlflowClient
-
+from models.lr_schedulers import get_scheduler
+import torch.nn as nn
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, ExponentialLR, LambdaLR
+from models.logger import set_verbosity_info, set_verbosity_error
 from models import Showo, MAGVITv2, get_mask_chedule
+
 from training.prompting_utils import (
     UniversalPrompting,
     create_attention_mask_predict_next,
     create_attention_mask_for_mmu,
 )
-from models.lr_schedulers import get_scheduler
-import torch.nn as nn
-from torch.optim.lr_scheduler import SequentialLR, LinearLR, ExponentialLR
-from models.logger import set_verbosity_info, set_verbosity_error
-from training.moe_utils import patch_and_freeze_moe
+from training.patch_model import patch_model_with_moe
+from training.moe_utils import LayerExpertStatsCollector
 from training.eval_utils import (
     visualize_predictions,
     generate_images,
@@ -49,14 +52,15 @@ from training.eval_utils import (
 )
 from training.dataset_utils import create_dataloaders
 from training.checkpoint_utils import save_checkpoint
-
 from training.utils import (
     get_config,
-    flatten_omega_conf,
     mask_or_random_replace_tokens,
     AverageMeter,
 )
-
+from training.moe_visualization import MoEVisualizer
+from training.moe_mlflow_logger import MoEMLflowLogger
+from training.profiling_context import get_profiling_context_torch
+            
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -86,7 +90,6 @@ def prepare_inputs_and_labels(
     )
     # Correct T2I sequence: T2I → SOT → [Text tokens] → EOT → SOI → [Image tokens] → EOI
     input_ids, masks, labels = uni_prompting((texts, input_ids, labels), "t2i")
-
     return input_ids, labels, mask_prob, image_tokens
 
 
@@ -324,7 +327,6 @@ def train_step(
                     moe_domain_id=flow_domain_id,
                 )
     
-    # Основной forward pass для обучения (со всеми данными)
     logits, loss_t2i, loss_lm, loss_mmu = model(
         input_ids=input_ids,
         input_embeddings=None,
@@ -336,8 +338,9 @@ def train_step(
         batch_size_mmu=batch_size_mmu,
         max_seq_length=config.dataset.preprocessing.max_seq_length,
         moe_temperature=current_temperature,
-        moe_domain_id=domain_id,  # Передаем domain_id в MoE
+        moe_domain_id=domain_id,
     )
+    
 
     # Gather the losses across all processes for logging (if we use distributed training).
     avg_loss_t2i = accelerator.gather(
@@ -350,44 +353,26 @@ def train_step(
         loss_mmu.repeat(config.training.batch_size_mmu)
     ).mean()
 
-    if config.get("moe", {}).get("enabled", False):
-        balance_loss, num_moe_layers = collect_moe_balance_losses(model)
-        if num_moe_layers == 0:
-            logger.warning(f"⚠️ MoE enabled but num_moe_layers = {num_moe_layers}")
-        balance_coeff = balance_scheduler.get_last_lr()[0]
-        print(f'balance_coeff: {balance_coeff}')
+    balance_loss, num_moe_layers = collect_moe_balance_losses(model)
+    if num_moe_layers == 0:
+        logger.warning(f"⚠️ MoE enabled but num_moe_layers = {num_moe_layers}")
         
-        # Логируем layer-expert heatmap каждые 50 шагов (когда global_step кратен 50)
-        should_log_layer_expert = (global_step > 0) and ((global_step + 1) % 50 == 0)
-        if should_log_layer_expert and mlflow_client is not None and mlflow_run_id is not None:
-            from moe_visualization import MoEVisualizer
-            from training.moe_mlflow_logger import MoEMLflowLogger
-            
-            unwrapped_model = accelerator.unwrap_model(model)
-            layer_expert_counts = {}
-            
-            for layer_idx, layer in enumerate(unwrapped_model.showo.model.layers):
-                if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
-                    # Получаем текущие expert_counts из последнего логирования
-                    if hasattr(layer.mlp, "_gate_distribution_history") and layer.mlp._gate_distribution_history:
-                        # Берем последний шаг из истории
-                        last_step = max(layer.mlp._gate_distribution_history.keys())
-                        expert_counts = layer.mlp._gate_distribution_history.get(last_step, {})
-                        if expert_counts:
-                            layer_expert_counts[layer_idx] = expert_counts
-            
-            if layer_expert_counts:
-                visualizer = MoEVisualizer(num_experts=config.moe.num_experts)
-                heatmap_bytes = visualizer.create_layer_expert_activation_heatmap(
-                    layer_expert_counts, global_step=global_step + 1
-                )
-                
-                mlflow_logger = MoEMLflowLogger(mlflow_client=mlflow_client, mlflow_run_id=mlflow_run_id)
-                mlflow_logger.log_layer_expert_heatmap(global_step + 1, heatmap_bytes)
-    else:
-        print(f'Setting balance_loss and balance_coeff to 0.0')
-        balance_loss = torch.tensor(0.0, device=accelerator.device)
-        balance_coeff = 0.0
+    balance_coeff = balance_scheduler.get_last_lr()[0]
+    should_log_layer_expert = (global_step + 1) % config.experiment['generate_every'] == 0
+    if should_log_layer_expert and mlflow_client is not None and mlflow_run_id is not None:
+        unwrapped_model = accelerator.unwrap_model(model)
+        collector = LayerExpertStatsCollector(unwrapped_model)
+        layer_expert_counts = collector.collect()
+        
+        if not layer_expert_counts:
+            raise Exception("No moe layers")
+        visualizer = MoEVisualizer(num_experts=config.moe.num_experts)
+        heatmap_bytes = visualizer.create_layer_expert_activation_heatmap(
+            layer_expert_counts, global_step=global_step + 1
+        )
+        
+        mlflow_logger = MoEMLflowLogger(mlflow_client=mlflow_client, mlflow_run_id=mlflow_run_id)
+        mlflow_logger.log_layer_expert_heatmap(global_step + 1, heatmap_bytes)
 
     loss = (
         config.training.t2i_coeff * loss_t2i
@@ -516,16 +501,11 @@ def collect_moe_balance_losses(model):
 
     for layer_idx, layer in enumerate(unwrapped_model.showo.model.layers):
         if hasattr(layer, "mlp") and hasattr(layer.mlp, "gate"):
-            if hasattr(layer.mlp.gate, "get_loss") and layer.mlp.gate.has_loss:
-                gate_loss = layer.mlp.gate.get_loss(
-                    clear=True
-                )
-                if gate_loss is not None:
-                    total_balance_loss += gate_loss
-                    num_moe_layers += 1
-                    logger.debug(
-                        f"MoE layer {layer_idx}: balance_loss = {gate_loss.item():.6f}"
-                    )
+            gate_loss, otrh_loss = layer.mlp.get_balance_loss()
+            total_balance_loss += gate_loss
+            total_balance_loss += otrh_loss
+            num_moe_layers += 1
+            logger.debug(f"MoE layer {layer_idx}: balance_loss = {gate_loss.item():.6f}, otrh_loss = {otrh_loss.item():.6f}")
     return total_balance_loss, num_moe_layers
 
 
@@ -539,9 +519,6 @@ def get_vq_model_class(model_type):
 
 
 def main():
-    #########################
-    # SETUP Accelerator     #
-    #########################
     config = get_config()
 
     # Enable TF32 on Ampere GPUs
@@ -551,16 +528,18 @@ def main():
         torch.backends.cudnn.deterministic = False
 
     config.experiment.logging_dir = str(Path(config.experiment.output_dir) / "logs")
-    from accelerate.utils import DistributedDataParallelKwargs
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    
+    # profile_kwargs = ProfileKwargs(
+    #     activities=["cuda"],
+    #     record_shapes=True
+    # )
 
     accelerator = Accelerator(
         gradient_accumulation_steps=config.training.gradient_accumulation_steps,
         mixed_precision=config.training.mixed_precision,
-        log_with="mlflow"
-        if config.get("mlflow", {}).get("enabled", False)
-        else None,  # MLflow вместо wandb
+        log_with="mlflow",
         project_dir=config.experiment.logging_dir,
         split_batches=True,
         kwargs_handlers=[ddp_kwargs],
@@ -730,45 +709,28 @@ def main():
         model = Showo(**config.model.showo).to(accelerator.device)
         logger.info(f"Created new model - vocab_size: {model.vocab_size}, mask_token_id: {model.mask_token_id}")
 
-    # MoE disabled for vanilla training
-    if config.get("moe", None) and config.moe.get("enabled", False):
-        special_tokens = {
-            "soi_id": uni_prompting.sptids_dict["<|soi|>"].item()
-            if "<|soi|>" in uni_prompting.sptids_dict
-            else None,
-            "eoi_id": uni_prompting.sptids_dict["<|eoi|>"].item()
-            if "<|eoi|>" in uni_prompting.sptids_dict
-            else None,
-            "sov_id": uni_prompting.sptids_dict["<|sov|>"].item()
-            if "<|sov|>" in uni_prompting.sptids_dict
-            else None,
-            "eov_id": uni_prompting.sptids_dict["<|eov|>"].item()
-            if "<|eov|>" in uni_prompting.sptids_dict
-            else None,
-        }
-    
-        model = patch_and_freeze_moe(
-            model,
-            count_layers_to_patch=config.moe["count_layers_to_patch"],
-            num_experts=config.moe["num_experts"],
-            top_k=config.moe["top_k"],
-            mlflow_client=mlflow_client,
-            mlflow_run_id=mlflow_run_id,
-            special_tokens=special_tokens,
-            use_modality_bias=config.moe['use_modality_bias'],
-            use_domain_bias=config.moe['use_domain_bias'],
-            modality_init_hardness=config.moe["modality_init_hardness"],
-            modality_init_steps=config.moe["modality_init_steps"],
-            modality_init_hardness_min=config.moe["modality_init_hardness_min"],
-            domain_init_hardness=config.moe["domain_init_hardness"],
-            domain_init_steps=config.moe["domain_init_steps"],
-            domain_init_hardness_min=config.moe["domain_init_hardness_min"],
-            use_gumbel=config.moe["use_gumbel"],
-            gate_capacity=config.moe.get("gate_capacity", None),
-            random_routing=config.moe.get("random_routing", False),
-            domain_to_expert_map=config.moe.get("domain_to_expert_map", None),
-        )
+    special_tokens = {
+        "soi_id": uni_prompting.sptids_dict["<|soi|>"].item()
+        if "<|soi|>" in uni_prompting.sptids_dict
+        else None,
+        "eoi_id": uni_prompting.sptids_dict["<|eoi|>"].item()
+        if "<|eoi|>" in uni_prompting.sptids_dict
+        else None,
+        "sov_id": uni_prompting.sptids_dict["<|sov|>"].item()
+        if "<|sov|>" in uni_prompting.sptids_dict
+        else None,
+        "eov_id": uni_prompting.sptids_dict["<|eov|>"].item()
+        if "<|eov|>" in uni_prompting.sptids_dict
+        else None,
+    }
 
+    model = patch_model_with_moe(
+        model,
+        config.moe,
+        mlflow_client=mlflow_client,
+        mlflow_run_id=mlflow_run_id,
+        special_tokens=special_tokens
+    )
     mask_id = model.mask_token_id
 
     ##################################
@@ -820,7 +782,6 @@ def main():
         temp_optimizer = torch.optim.SGD([{"params": [_temp_dummy_param], "lr": temp_fixed_value}])
         def _constant_factor(step: int):
             return 1.0  # Всегда возвращаем 1.0, чтобы lr оставался temp_fixed_value
-        from torch.optim.lr_scheduler import LambdaLR
         temp_scheduler = LambdaLR(temp_optimizer, lr_lambda=_constant_factor)
     else:
         # Scheduler с изменением температуры
@@ -833,7 +794,6 @@ def main():
             s = min(int(step), int(max(temp_steps, 1)))
             a = s / max(temp_steps, 1)
             return (1.0 - a) + a * (temp_end / max(temp_start, 1e-8))
-        from torch.optim.lr_scheduler import LambdaLR
         temp_scheduler = LambdaLR(temp_optimizer, lr_lambda=_linear_factor)
 
     ##################################

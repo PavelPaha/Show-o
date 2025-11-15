@@ -7,7 +7,13 @@ import logging
 from typing import Optional
 from models.phi import PhiConfig
 from models.moe_gates.gshard_gate import GShardGate
+from training.moe_visualization import MoEVisualizer
+from training.moe_utils import (
+    compute_modality_bias_tensor,
+    compute_domain_bias_tensor,
+)
 
+from collections import defaultdict
 
 
 class SmallPhiMLP(nn.Module):
@@ -32,56 +38,56 @@ class SmallPhiMLP(nn.Module):
 
 class MoE(nn.Module):
     def __init__(
-        self, 
-        num_experts,
-        hidden_size,
-        top_k,
+        self,
         config: PhiConfig,
+        moe_config,
         template_mlp: Optional[nn.Module] = None,
-        noise_std: float = 1e-3,
-        use_modality_bias: bool = False,
-        use_domain_bias: bool = False,
-        modality_init_hardness: float = 1.0,
-        modality_init_steps: int = 1000, 
-        modality_init_hardness_min: float = 0.2,
-        domain_init_hardness: float = 1.0,
-        domain_init_steps: int = 1000,
-        domain_init_hardness_min: float = 0.0,
-        use_gumbel: bool = False,
-        gate_capacity: Optional[float] = None,
-        random_routing: bool = False,
-        domain_to_expert_map: Optional[dict] = None,
+        mlflow_logger = None,
+        visualizer = None,
+        layer_idx = None,
+        special_tokens = None,
     ):
         super().__init__()
-        # Используем gate_capacity если задан, иначе дефолтное значение (1.2, 2.4)
-        # gate_capacity может быть числом (например 2.0) или tuple (1.2, 2.4)
-        if gate_capacity is not None:
-            if isinstance(gate_capacity, (int, float)):
-                capacity_tuple = (float(gate_capacity), float(gate_capacity))
-            else:
-                capacity_tuple = gate_capacity
-        else:
-            capacity_tuple = (1.2, 2.4)  # дефолт от GShard
+        self.moe_config = moe_config
+        self.num_experts = int(moe_config["num_experts"])
+        self.top_k = int(moe_config["top_k"])
+        noise_std = float(moe_config["noise_std"])
+        use_modality_bias = bool(moe_config["use_modality_bias"])
+        use_domain_bias = bool(moe_config["use_domain_bias"])
+        modality_init_hardness = float(moe_config["modality_init_hardness"])
+        modality_init_steps = int(moe_config["modality_init_steps"])
+        modality_init_hardness_min = float(moe_config["modality_init_hardness_min"])
+        domain_init_hardness = float(moe_config["domain_init_hardness"])
+        domain_init_steps = int(moe_config["domain_init_steps"])
+        domain_init_hardness_min = float(moe_config["domain_init_hardness_min"])
+        gate_capacity = tuple(moe_config["gate_capacity"])
+        assert len(gate_capacity) == 2
+        random_routing = bool(moe_config["random_routing"])
+        domain_to_expert_map = moe_config["domain_to_expert_map"]
+        log_gates = bool(moe_config["log_gates"])
+        log_activations = bool(moe_config["log_activations"])
+        log_frequency = int(moe_config["log_frequency"])
+        hidden_size = config.hidden_size
+        num_experts = int(moe_config["num_experts"])
+        top_k = int(moe_config["top_k"])
         
         self.gate = GShardGate(
             hidden_size, 
             num_experts, 
             world_size=4, 
             top_k=top_k, 
-            capacity=capacity_tuple,
+            capacity=gate_capacity,
             random_routing=random_routing,
             gate_bias=True
         )
-        self.num_experts = num_experts
         self.hidden_size = hidden_size
-        self.top_k = top_k
-        num_text_experts = num_experts // 2
-        tot_expert = num_experts * 4  # world_size=4
+        num_text_experts = self.num_experts // 2
+        tot_expert = self.num_experts * 4  # world_size=4
         self.register_buffer('modality_bias_text', torch.zeros(tot_expert))
         self.register_buffer('modality_bias_image', torch.zeros(tot_expert))
         init_bias_val = 0.0
         for rank in range(4):  # world_size=4
-            start_text = rank * num_experts
+            start_text = rank * self.num_experts
             end_text = start_text + num_text_experts
             start_image = end_text
             end_image = start_image + num_text_experts
@@ -129,18 +135,20 @@ class MoE(nn.Module):
         # чтобы избежать ошибок DDP, если некоторые эксперты не используются в итерации.
         self.register_buffer('alpha', torch.ones(self.num_experts))
         self._step_count = 0
-        self._log_frequency = 100
+        self._log_frequency = log_frequency
         self._global_step = 0
-        self._layer_id = None
-        self._soi_id = None
-        self._eoi_id = None
-        self._sov_id = None
-        self._eov_id = None
-        self._gate_distribution_history = {}
-        self._modality_gate_distribution_history = {}
-        self._domain_gate_distribution_history = {}
-        self._mlflow_logger = None
-        self._visualizer = None
+        self._layer_id = layer_idx
+        self._soi_id = special_tokens.get("soi_id")
+        self._eoi_id = special_tokens.get("eoi_id")
+        self._sov_id = special_tokens.get("sov_id")
+        self._eov_id = special_tokens.get("eov_id")
+        self._gate_distribution_history = defaultdict(dict)
+        self._mlflow_logger = mlflow_logger
+        self._visualizer : MoEVisualizer = visualizer
+
+        self._log_gates = log_gates
+        self._log_activations = log_activations
+        self._log_frequency = log_frequency
 
     def set_global_step(self, global_step):
         self._global_step = global_step
@@ -159,61 +167,26 @@ class MoE(nn.Module):
         hidden_states_flat = hidden_states.view(-1, hidden_size)  # [B*L, H]
         B = hidden_states_flat.shape[0]
 
-        modality_bias = None
-        if hasattr(self, 'use_modality_bias') and not self.use_modality_bias:
-            pass
-        elif input_ids is not None and self.modality_init_hardness > 0:
-            # Вычисляем текущую hardness (линейное уменьшение от max до min)
-            # Не убираем bias полностью - оставляем минимальное значение для мягкого сигнала
-            if self._global_step < self.modality_init_steps:
-                # Линейное уменьшение от max до min за modality_init_steps шагов
-                progress = self._global_step / max(self.modality_init_steps, 1)
-                hardness = self.modality_init_hardness - (self.modality_init_hardness - self.modality_init_hardness_min) * progress
-            else:
-                hardness = self.modality_init_hardness_min
-            
-            if hardness > 0:
-                modality = self._get_token_modality(input_ids.view(-1))
-                if modality is not None:
-                    text_mask = (modality == 0)
-                    image_mask = (modality == 1)
-                    # Создаем bias для каждого токена: [B, E_tot]
-                    modality_bias = torch.zeros(B, self.modality_bias_text.size(0), device=device, dtype=hidden_states.dtype)
-                    if text_mask.any():
-                        modality_bias[text_mask] = self.modality_bias_text.unsqueeze(0) * hardness
-                    if image_mask.any():
-                        modality_bias[image_mask] = self.modality_bias_image.unsqueeze(0) * hardness
         total_bias = None
+        modality_bias = compute_modality_bias_tensor(
+            self,
+            input_ids,
+            B,
+            hidden_states.dtype,
+            device,
+        )
         if modality_bias is not None:
             total_bias = modality_bias
 
-        domain_bias_tensor = None
-        if self.use_domain_bias and domain_id is not None:
-            if self._global_step < self.domain_init_steps:
-                progress = self._global_step / max(self.domain_init_steps, 1)
-                domain_hardness = self.domain_init_hardness - (
-                    self.domain_init_hardness - self.domain_init_hardness_min
-                ) * progress
-            else:
-                domain_hardness = self.domain_init_hardness_min
-
-            if domain_hardness > 0:
-                domain_key = str(domain_id)
-                buffer_name = self._domain_bias_buffer_map.get(domain_key)
-                if buffer_name is not None:
-                    domain_bias_vector = getattr(self, buffer_name)
-                    domain_bias_tensor = (
-                        domain_bias_vector.unsqueeze(0)
-                        .expand(B, -1)
-                        .to(device=device, dtype=hidden_states.dtype)
-                        * domain_hardness
-                    )
-
+        domain_bias_tensor = compute_domain_bias_tensor(
+            self,
+            domain_id,
+            B,
+            hidden_states.dtype,
+            device,
+        )
         if domain_bias_tensor is not None:
-            if total_bias is None:
-                total_bias = domain_bias_tensor.to(device=device, dtype=hidden_states.dtype)
-            else:
-                total_bias = total_bias + domain_bias_tensor.to(device=device, dtype=hidden_states.dtype)
+            total_bias = domain_bias_tensor if total_bias is None else total_bias + domain_bias_tensor
 
         if bias is not None:
             bias = bias.to(device=device, dtype=hidden_states.dtype)
@@ -223,8 +196,6 @@ class MoE(nn.Module):
                 total_bias = total_bias + bias
 
         gate_idx, gate_score = self.gate(hidden_states_flat, temperature=temperature, bias=total_bias)
-        
-        # Определяем overflowed токены: те, у которых оба эксперта топ1 и топ2 равны -1
         overflowed_mask = (gate_idx[:, 0] == -1) & (gate_idx[:, 1] == -1)
         
         out_flat = torch.zeros(B, hidden_size, device=device, dtype=hidden_states.dtype)
@@ -246,18 +217,17 @@ class MoE(nn.Module):
 
         output = out_flat.view(batch_size, seq_len, hidden_size)
         self._step_count += 1
-        # Используем _global_step для проверки, чтобы все домены логировались одновременно
-        should_log = (self._global_step > 0) and (self._global_step % self._log_frequency == 0)
-        if hasattr(self, '_log_gates') and self._log_gates and should_log:
+        should_log = self._global_step % self._log_frequency == 0
+        if self._log_gates and should_log:
             self._log_gate_distribution(gate_idx, gate_score.detach(), input_ids, domain_id=domain_id)
 
         return output
 
 
     def _log_gate_distribution(self, gate_idx, gate_score, input_ids=None, domain_id=None):
-        logger = logging.getLogger(__name__)
-        
-        modality = self._get_token_modality(input_ids.view(-1) if input_ids is not None else None)
+        modality = None
+        if isinstance(input_ids, torch.Tensor):
+            modality = self._get_token_modality(input_ids.view(-1))
         
         expert_counts = {}
         for expert_id in range(self.num_experts):
@@ -266,7 +236,7 @@ class MoE(nn.Module):
         
         total_activations = sum(expert_counts.values())
         
-        self._gate_distribution_history[self._global_step] = expert_counts.copy()
+        self._accumulate_history(self._gate_distribution_history['overall'], expert_counts)
         self._save_distribution_to_json(expert_counts, "overall")
         
         text_expert_counts = None
@@ -284,43 +254,41 @@ class MoE(nn.Module):
             ]
             
             for modality_name, mask in modalities:
-                if mask.any():
-                    modality_gate_idx = gate_idx[mask]
-                    modality_gate_score = gate_score[mask]
-                    modality_expert_counts = {}
-                    for expert_id in range(self.num_experts):
-                        count = (modality_gate_idx == expert_id).sum().item()
-                        modality_expert_counts[expert_id] = count
+                modality_gate_idx = gate_idx[mask]
+                modality_gate_score = gate_score[mask]
+                modality_expert_counts = {}
+                for expert_id in range(self.num_experts):
+                    count = (modality_gate_idx == expert_id).sum().item()
+                    modality_expert_counts[expert_id] = count
+                
+                modality_total = sum(modality_expert_counts.values())
+                
+                self._accumulate_history(self._gate_distribution_history[modality_name], modality_expert_counts)
+                self._save_distribution_to_json(modality_expert_counts, modality_name)
+                
+                if modality_name == "text":
+                    text_expert_counts = modality_expert_counts
+                elif modality_name == "image":
+                    image_expert_counts = modality_expert_counts
+                
+                self._log_to_mlflow_modality_gates(
+                    modality_expert_counts, modality_total, modality_gate_score, modality_name
+                )
                     
-                    modality_total = sum(modality_expert_counts.values())
-                    
-                    if modality_name not in self._modality_gate_distribution_history:
-                        self._modality_gate_distribution_history[modality_name] = {}
-                    self._modality_gate_distribution_history[modality_name][self._global_step] = modality_expert_counts.copy()
-                    self._save_distribution_to_json(modality_expert_counts, modality_name)
-                    
-                    if modality_name == "text":
-                        text_expert_counts = modality_expert_counts
-                    elif modality_name == "image":
-                        image_expert_counts = modality_expert_counts
-                    
-                    if modality_total > 0:
-                        self._log_to_mlflow_modality_gates(
-                            modality_expert_counts, modality_total, modality_gate_score, modality_name
-                        )
+                        
         
         if total_activations > 0:
             self._log_to_mlflow_gates(expert_counts, total_activations, gate_score)
         
+        if domain_id is not None:
+            self._ensure_domain_buffer(domain_id)
         if domain_id is not None:
             domain_expert_counts = {}
             for expert_id in range(self.num_experts):
                 count = (gate_idx == expert_id).sum().item()
                 domain_expert_counts[expert_id] = count
             
-            if domain_id not in self._domain_gate_distribution_history:
-                self._domain_gate_distribution_history[domain_id] = {}
-            self._domain_gate_distribution_history[domain_id][self._global_step] = domain_expert_counts.copy()
+            self._accumulate_history(self._gate_distribution_history[domain_id], domain_expert_counts)
             self._save_distribution_to_json(domain_expert_counts, f"domain_{domain_id}")
         
 
@@ -333,8 +301,9 @@ class MoE(nn.Module):
         )
     
     
-    def _log_all_plots_to_mlflow(self, overall_expert_counts, overall_gate_score, 
-                                   text_expert_counts=None, image_expert_counts=None, domain_id=None):
+    def _log_all_plots_to_mlflow(self, overall_expert_counts, 
+                                    overall_gate_score, 
+                                    text_expert_counts=None, image_expert_counts=None, domain_id=None):
         if self._mlflow_logger is None or self._visualizer is None:
             return
         
@@ -344,11 +313,11 @@ class MoE(nn.Module):
         
         overall_histogram_bytes = self._visualizer.create_expert_activation_histogram(overall_expert_counts)
         
-        text_history = self._modality_gate_distribution_history.get("text", {})
-        image_history = self._modality_gate_distribution_history.get("image", {})
+        text_history = self._gate_distribution_history["text"]
+        image_history = self._gate_distribution_history["image"]
         combined_plot_bytes = self._visualizer.create_modality_combined_plot(
-            text_history=text_history if text_history else None,
-            image_history=image_history if image_history else None,
+            text_history=text_history,
+            image_history=image_history,
             text_expert_counts=text_expert_counts,
             image_expert_counts=image_expert_counts,
             global_step=self._global_step
@@ -356,14 +325,14 @@ class MoE(nn.Module):
         
         domain_plot_bytes = None
         if domain_id is not None:
-            domain_history = self._domain_gate_distribution_history.get(domain_id, {})
+            domain_history = self._gate_distribution_history.get(domain_id, {})
             current_expert_counts = domain_history.get(self._global_step, {}) if domain_history else {}
             domain_plot_bytes = self._visualizer.create_domain_plot(
                 domain_id, domain_history, self._global_step, current_expert_counts
             )
         
         all_domains_plot_bytes = self._visualizer.create_all_domains_combined_plot(
-            self._domain_gate_distribution_history, self._global_step
+            self._gate_distribution_history, self._global_step
         )
         
         self._mlflow_logger.log_all_plots(
@@ -377,39 +346,47 @@ class MoE(nn.Module):
             domain_id=domain_id
         )
     
-
-
-    def enable_logging(self, log_gates=True, log_activations=True, log_frequency=100):
-        self._log_gates = log_gates
-        self._log_activations = log_activations
-        self._log_frequency = log_frequency
+    def _accumulate_history(self, history_dict, counts):
+        existing = history_dict.get(self._global_step)
+        if existing is None:
+            history_dict[self._global_step] = counts.copy()
+        else:
+            for expert_id, count in counts.items():
+                existing[expert_id] = existing.get(expert_id, 0) + count
 
 
     def set_global_step(self, global_step):
         self._global_step = global_step
+        
+    def get_balance_loss(self, clear=True):
+        gate_loss =  self.gate.get_loss(clear=clear)
+        orthogonal_loss = torch.zeros_like(gate_loss)
+        return gate_loss, orthogonal_loss
+        
 
+    def _ensure_domain_buffer(self, domain_id: str):
+        domain_key = str(domain_id)
+        buffer_name = self._domain_bias_buffer_map.get(domain_key)
+        if buffer_name is None:
+            buffer_name = f"_domain_bias_vec_extra_{len(self._domain_bias_buffer_map)}"
+            bias_vec = torch.zeros(
+                self.num_experts * self.world_size,
+                dtype=torch.float32,
+                device=self.modality_bias_text.device,
+            )
+            self.register_buffer(buffer_name, bias_vec)
+            self._domain_bias_buffer_map[domain_key] = buffer_name
+        return getattr(self, buffer_name)
 
-    def set_layer_id(self, layer_id):
-        self._layer_id = layer_id
-    
-
-    def set_special_tokens(self, soi_id=None, eoi_id=None, sov_id=None, eov_id=None):
-        self._soi_id = soi_id
-        self._eoi_id = eoi_id
-        self._sov_id = sov_id
-        self._eov_id = eov_id
-    
-
-    def set_mlflow_logger(self, mlflow_logger):
-        self._mlflow_logger = mlflow_logger
-    
-
-    def set_visualizer(self, visualizer):
-        self._visualizer = visualizer
-    
 
     def _get_token_modality(self, input_ids_flat):
-        if input_ids_flat is None or self._soi_id is None or self._eoi_id is None:
+        if (
+            input_ids_flat is None
+            or not isinstance(input_ids_flat, torch.Tensor)
+            or input_ids_flat.dtype not in (torch.int16, torch.int32, torch.int64)
+            or self._soi_id is None
+            or self._eoi_id is None
+        ):
             return None
         modality = torch.zeros(input_ids_flat.shape[0], dtype=torch.long, device=input_ids_flat.device)
         soi_positions = (input_ids_flat == self._soi_id).nonzero(as_tuple=True)[0]
@@ -474,19 +451,10 @@ class MoE(nn.Module):
             json.dump(data, f, indent=2)
     
 
-    
-    def log_distribution_heatmap_to_mlflow(self, modality_name="overall", alpha_value=None):
+    def log_distribution_heatmap_to_mlflow(self, modality_name=None, alpha_value=None):
         if self._mlflow_logger is None or self._visualizer is None:
             return
-        
-        if modality_name == "overall":
-            history = self._gate_distribution_history
-        else:
-            history = self._modality_gate_distribution_history.get(modality_name, {})
-        
-        if not history:
-            return
-        
+        history = self._gate_distribution_history[modality_name]
         heatmap_bytes = self._visualizer.create_distribution_heatmap(
             history, modality_name, self._global_step, alpha_value
         )

@@ -2,6 +2,7 @@ import io
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, Optional
+import torch
 
 
 class MoEVisualizer:
@@ -506,11 +507,11 @@ class MoEVisualizer:
         domain_distribution_history: Dict[str, Dict[int, Dict[int, int]]],
         global_step: int,
     ) -> bytes:
-        all_domains = list(domain_distribution_history.keys())
-        if 'video' in all_domains:
-            all_domains.remove('video')
+        # Filter out modality keys, keep only actual domains
+        # modality_keys = {'overall', 'text', 'image', 'video'}
+        all_domains = [k for k in domain_distribution_history.keys()]
         all_domains = sorted(all_domains)
-        print(f'All domains = {all_domains}')
+        print(f'[Visualizer] All domains after filtering: {all_domains}')
         n_domains = len(all_domains)
 
         fig, axes = plt.subplots(n_domains, 2, figsize=(12, 4 * n_domains))
@@ -605,6 +606,179 @@ class MoEVisualizer:
         buf.seek(0)
         plt.close()
 
+        return buf.getvalue()
+
+    def create_modality_probability_plot(
+        self,
+        probability_history: Dict[str, Dict[int, torch.Tensor]],
+        global_step: int,
+    ) -> bytes | None:
+        keys = sorted(probability_history.keys())
+        available = []
+        for key in keys:
+            history = probability_history.get(key, {})
+            if history and any(value is not None for value in history.values()):
+                available.append(key)
+        if not available:
+            return None
+
+        fig, axes = plt.subplots(
+            len(available),
+            2,
+            figsize=(14, max(3, 2.5 * len(available))),
+            squeeze=False,
+        )
+        fig.suptitle(
+            f"Gate Probability by Modality/Domain - Layer {self.layer_id} - Step {global_step}",
+            fontsize=16,
+            fontweight="bold",
+            y=0.995,
+        )
+
+        for idx, key in enumerate(available):
+            modality_history = probability_history.get(key, {})
+            steps = sorted(modality_history.keys())
+            recent_steps = steps[-min(10, len(steps)) :]
+            ax_heatmap = axes[idx, 0]
+            if recent_steps:
+                heatmap_data = []
+                for step in recent_steps:
+                    probs_tensor = modality_history[step]
+                    probs = (
+                        probs_tensor.detach().cpu().numpy()
+                        if isinstance(probs_tensor, torch.Tensor)
+                        else np.array(probs_tensor)
+                    )
+                    heatmap_data.append(probs)
+                heatmap_matrix = np.stack(heatmap_data, axis=1)
+                im = ax_heatmap.imshow(
+                    heatmap_matrix,
+                    aspect="auto",
+                    cmap="viridis",
+                    interpolation="nearest",
+                    vmin=0,
+                    vmax=1,
+                )
+                ax_heatmap.set_title(f"{key} - history", fontsize=12, fontweight="bold")
+                ax_heatmap.set_xlabel("Recent Steps", fontsize=10)
+                ax_heatmap.set_ylabel("Expert ID", fontsize=10)
+                ax_heatmap.set_yticks(range(self.num_experts))
+                ax_heatmap.set_yticklabels(range(self.num_experts))
+                ax_heatmap.set_xticks(range(len(recent_steps)))
+                ax_heatmap.set_xticklabels([str(s) for s in recent_steps], rotation=45, ha="right")
+                plt.colorbar(im, ax=ax_heatmap, fraction=0.046, pad=0.04)
+            else:
+                ax_heatmap.set_title(f"{key} - history", fontsize=12, fontweight="bold")
+                ax_heatmap.text(
+                    0.5,
+                    0.5,
+                    "No data",
+                    ha="center",
+                    va="center",
+                    transform=ax_heatmap.transAxes,
+                )
+                ax_heatmap.axis("off")
+
+            ax_bar = axes[idx, 1]
+            probs_tensor = modality_history.get(global_step)
+            if probs_tensor is None:
+                ax_bar.set_title(f"{key} - avg probs (no data)", fontsize=12, fontweight="bold")
+                ax_bar.axis("off")
+                continue
+            probs = (
+                probs_tensor.detach().cpu().numpy()
+                if isinstance(probs_tensor, torch.Tensor)
+                else np.array(probs_tensor)
+            )
+            expert_ids = np.arange(len(probs))
+            ax_bar.bar(expert_ids, probs, color="darkorange", edgecolor="black", alpha=0.8)
+            max_val = probs.max() if probs.size else 1.0
+            ax_bar.set_ylim(0.0, max(1.0, max_val * 1.1))
+            ax_bar.set_title(f"{key} - avg probs", fontsize=12, fontweight="bold")
+            ax_bar.set_xlabel("Expert ID", fontsize=10)
+            ax_bar.set_ylabel("Probability", fontsize=10)
+            ax_bar.grid(True, alpha=0.3)
+            if probs.size:
+                for expert_id, value in zip(expert_ids, probs):
+                    if value > 0.01:
+                        ax_bar.text(
+                            expert_id,
+                            value + 0.01,
+                            f"{value:.2f}",
+                            ha="center",
+                            va="bottom",
+                            fontsize=8,
+                        )
+
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+        buf.seek(0)
+        plt.close()
+        return buf.getvalue()
+    def create_layer_probability_heatmap(
+        self,
+        layer_probability_map: Dict[int, torch.Tensor],
+        modality_name: str,
+        global_step: int,
+    ) -> bytes | None:
+        if not layer_probability_map:
+            return None
+
+        layer_ids = sorted(layer_probability_map.keys())
+        matrix = np.zeros((len(layer_ids), self.num_experts))
+        for row_idx, layer_id in enumerate(layer_ids):
+            probs_tensor = layer_probability_map[layer_id]
+            probs = (
+                probs_tensor.detach().cpu().numpy()
+                if isinstance(probs_tensor, torch.Tensor)
+                else np.array(probs_tensor)
+            )
+            matrix[row_idx, : len(probs)] = probs
+
+        fig, ax = plt.subplots(figsize=(10, max(8, len(layer_ids) * 0.5)))
+        im = ax.imshow(
+            matrix,
+            aspect="auto",
+            cmap="viridis",
+            interpolation="nearest",
+            vmin=0,
+            vmax=1,
+        )
+        ax.set_title(
+            f"{modality_name} Probability Heatmap - Step {global_step}",
+            fontsize=14,
+            fontweight="bold",
+        )
+        ax.set_xlabel("Expert ID", fontsize=12)
+        ax.set_ylabel("Layer Index", fontsize=12)
+        ax.set_xticks(range(self.num_experts))
+        ax.set_xticklabels(range(self.num_experts))
+        ax.set_yticks(range(len(layer_ids)))
+        ax.set_yticklabels(layer_ids)
+        plt.colorbar(im, ax=ax, label="Probability")
+
+        if len(layer_ids) <= 24 and self.num_experts <= 16:
+            for row_idx in range(len(layer_ids)):
+                for col_idx in range(self.num_experts):
+                    value = matrix[row_idx, col_idx]
+                    if value > 0.01:
+                        ax.text(
+                            col_idx,
+                            row_idx,
+                            f"{value:.2f}",
+                            ha="center",
+                            va="center",
+                            color="white" if value > 0.5 else "black",
+                            fontsize=8,
+                        )
+
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+        buf.seek(0)
+        plt.close()
         return buf.getvalue()
 
     def create_layer_expert_activation_heatmap(

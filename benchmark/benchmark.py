@@ -1,20 +1,20 @@
 import os
 import sys
+import random
 
 sys.path.insert(0, "/home/jovyan/vasiliev/notebooks/Show-o")
 
 import torch
 import torch.nn.functional as F
 from inference_t2i import get_model, get_vq_model_class
-from coco_dataset import COCODataset
+from benchmark.coco_dataset import COCODataset
 from transformers import AutoTokenizer
 from torchvision import transforms
 from tqdm import tqdm
 from PIL import Image
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any
-from tqdm import tqdm
+from typing import List, Dict, Any, Sequence
 import numpy as np
 from omegaconf import OmegaConf
 from torchmetrics.image.fid import FrechetInceptionDistance
@@ -27,7 +27,7 @@ from training.prompting_utils import (
     create_attention_mask_predict_next,
 )
 
-from utils import create_comparison_image
+# from utils import create_comparison_image
 
 
 def transpose_batch(arr):
@@ -74,7 +74,7 @@ class ShowoBenchmark:
         vq_model.eval()
 
         self.vq_model = vq_model
-        self.fid_metric = FrechetInceptionDistance(feature=64)
+        self.fid_metric = FrechetInceptionDistance(feature=64).to(self.device)
         self.mask_token_id = self.model.config.mask_token_id
 
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -101,17 +101,26 @@ class ShowoBenchmark:
         )
 
     def run(self):
+        full_indices = list(range(len(self.coco_dataset)))
+        return self._evaluate_indices(full_indices)
+
+    def run_subset(self, subset_size=1000, seed=42):
+        if subset_size <= 0:
+            raise ValueError("subset_size must be positive")
+        indices = list(range(len(self.coco_dataset)))
+        rng = random.Random(seed)
+        rng.shuffle(indices)
+        subset = indices[: min(subset_size, len(indices))]
+        return self._evaluate_indices(subset)
+
+    def _evaluate_indices(self, indices: Sequence[int]):
         config = self.config
         uni_prompting = self.uni_prompting
-        for step in tqdm(
-            range(
-                0,
-                min(self.steps, len(self.coco_dataset)),
-                self.batch_size,
-            )
-        ):
+        total = min(len(indices), self.steps)
+        for start in tqdm(range(0, total, self.batch_size)):
+            current_indices = indices[start : start + self.batch_size]
             batch: List[Dict[str, Any]] = transpose_batch(
-                [self.coco_dataset[i] for i in range(step, step + self.batch_size)]
+                [self.coco_dataset[i] for i in current_indices]
             )
             prompts = batch["caption"]
             gt_images = batch["image"]
@@ -202,19 +211,19 @@ class ShowoBenchmark:
                 zip(pil_images, gt_images)
             ):
                 # Создаем сравнительную картинку если включено сохранение
-                if self.save_comparisons:
-                    caption = (
-                        prompts[img_idx] if img_idx < len(prompts) else "No caption"
-                    )
-                    comparison_path = create_comparison_image(
-                        generated_image,
-                        gt_image,
-                        caption,
-                        step,
-                        img_idx,
-                        self.output_dir,
-                    )
-                    print(f"Сохранено сравнение: {comparison_path}")
+                # if self.save_comparisons:
+                #     caption = (
+                #         prompts[img_idx] if img_idx < len(prompts) else "No caption"
+                #     )
+                #     comparison_path = create_comparison_image(
+                #         generated_image,
+                #         gt_image,
+                #         caption,
+                #         start,
+                #         img_idx,
+                #         self.output_dir,
+                #     )
+                #     print(f"Сохранено сравнение: {comparison_path}")
 
                 gt_tensor = (
                     (transform_to_tensor(gt_image) * 255).unsqueeze(0).to(torch.uint8)
@@ -238,7 +247,9 @@ class ShowoBenchmark:
                 print(f"Calculated FID score: {fid_score.item()}")
 
         final_fid = self.fid_metric.compute()
-        print(f"Final FID: {final_fid.item()}")
+        final_value = final_fid.item()
+        print(f"Final FID: {final_value}")
+        return final_value
 
 
 if __name__ == "__main__":

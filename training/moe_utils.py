@@ -1,24 +1,58 @@
 from typing import Dict
 import torch
+from copy import deepcopy
+from collections import defaultdict
 
 class LayerExpertStatsCollector:
     def __init__(self, unwrapped_model):
         self.model = unwrapped_model
 
-    def collect(self) -> Dict[int, Dict[int, int]]:
-        layer_expert_counts: Dict[int, Dict[int, int]] = {}
+    def collect(self, global_step) -> Dict[str, Dict[int, Dict[int, int]]]:
+        layer_expert_counts: Dict[str, Dict[int, Dict[int, int]]] =  defaultdict(dict)
+        modality_layer_probs: Dict[str, Dict[int, torch.Tensor]] = defaultdict(dict)
+
         for layer_idx, layer in enumerate(self.model.showo.model.layers):
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
-                history = layer.mlp._gate_distribution_history.get('overall', {})
-                aggregated_counts: Dict[int, int] = {}
-                for step_counts in history.values():
-                    for expert_id, count in step_counts.items():
-                        aggregated_counts[expert_id] = (
-                            aggregated_counts.get(expert_id, 0) + count
-                        )
-                if aggregated_counts:
-                    layer_expert_counts[layer_idx] = aggregated_counts
-        return layer_expert_counts
+                distr_hist = deepcopy(layer.mlp._gate_distribution_history)
+                prob_history = deepcopy(layer.mlp._gate_probability_history)
+                
+                print(f'Modalities: {list(prob_history.keys())}')
+
+                for modality, history in prob_history.items():
+                    probs = history.get(global_step)
+                    modality_layer_probs[modality][layer_idx] = probs.detach().cpu()
+                print(f'{distr_hist=}')
+                print(f'{prob_history=}')
+
+                for modality, history in distr_hist.items():
+                    if modality not in layer_expert_counts:
+                        layer_expert_counts[modality] = {}
+
+                    aggregated_counts: Dict[int, int] = {}
+                    for step_counts in history.values():
+                        if not isinstance(step_counts, dict):
+                            continue
+                        for expert_id, count in step_counts.items():
+                            aggregated_counts[expert_id] = (
+                                aggregated_counts.get(expert_id, 0) + int(count)
+                            )
+
+                    layer_expert_counts[modality][layer_idx] = aggregated_counts
+
+        return layer_expert_counts, modality_layer_probs
+
+    def collect_probabilities(self, global_step: int) -> Dict[str, Dict[int, torch.Tensor]]:
+        modality_layer_probs: Dict[str, Dict[int, torch.Tensor]] = defaultdict(dict)
+
+        for layer_idx, layer in enumerate(self.model.showo.model.layers):
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "_gate_probability_history"):
+                prob_history = layer.mlp._gate_probability_history
+                for modality, history in prob_history.items():
+                    probs = history.get(global_step)
+                    if probs is not None:
+                        modality_layer_probs[modality][layer_idx] = probs.detach().cpu()
+
+        return modality_layer_probs
 
 
 def compute_modality_bias_tensor(moe_layer, input_ids, num_tokens, dtype, device):

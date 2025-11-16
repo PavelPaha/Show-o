@@ -1010,6 +1010,7 @@ class PhiDecoderLayer(nn.Module):
         input_ids: Optional[torch.LongTensor] = None,
         moe_temperature: Optional[float] = None,
         moe_domain_id: Optional[str] = None,
+        moe_sample_domains = None,
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
@@ -1053,6 +1054,8 @@ class PhiDecoderLayer(nn.Module):
             mlp_forward_args['temperature'] = moe_temperature
         if hasattr(self.mlp, 'forward') and 'domain_id' in self.mlp.forward.__code__.co_varnames:
             mlp_forward_args['domain_id'] = moe_domain_id
+        if hasattr(self.mlp, 'forward') and 'sample_domains' in self.mlp.forward.__code__.co_varnames:
+            mlp_forward_args['sample_domains'] = moe_sample_domains
         ff = self.resid_dropout(self.mlp(hidden_states, **mlp_forward_args))
         hidden_states = attn_outputs + ff + residual
         outputs = (hidden_states,)
@@ -1125,6 +1128,7 @@ class PhiModel(PhiPreTrainedModel):
         return_dict: Optional[bool] = None,
         moe_temperature: Optional[float] = None,
         moe_domain_id: Optional[str] = None,
+        moe_sample_domains = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = (
             output_attentions
@@ -1233,6 +1237,7 @@ class PhiModel(PhiPreTrainedModel):
                     input_ids=input_ids,
                     moe_temperature=moe_temperature,
                     moe_domain_id=moe_domain_id,
+                    moe_sample_domains=moe_sample_domains,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1326,6 +1331,7 @@ class PhiForCausalLM(PhiPreTrainedModel):
         return_dict: Optional[bool] = None,
         moe_temperature: Optional[float] = None,
         moe_domain_id: Optional[str] = None,
+        moe_sample_domains = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1380,6 +1386,7 @@ class PhiForCausalLM(PhiPreTrainedModel):
             return_dict=return_dict,
             moe_temperature=moe_temperature,
             moe_domain_id=moe_domain_id,
+            moe_sample_domains=moe_sample_domains,
         )
 
         hidden_states = outputs[0]

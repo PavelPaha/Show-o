@@ -1,6 +1,7 @@
+import os
+import random
 from torch.utils.data import Dataset
 from pycocotools.coco import COCO
-import os
 from PIL import Image
 
 
@@ -11,10 +12,9 @@ class COCODataset(Dataset):
         self.transform = transform
         self.coco = COCO(annFile)
         self.ids = list(self.coco.imgs.keys())
-        self.shift = 9
 
     def __len__(self):
-        return len(self.coco.imgs)
+        return len(self.ids)
 
     def __getitem__(self, idx):
         idx = self.ids[idx]
@@ -22,21 +22,22 @@ class COCODataset(Dataset):
         img = self.coco.loadImgs(img_id)[0]
         img_path = os.path.join(self.root, img["file_name"])
         img = Image.open(img_path).convert("RGB")
-
-        # Получаем аннотации для этого изображения
         ann_ids = self.coco.getAnnIds(imgIds=img_id)
         anns = self.coco.loadAnns(ann_ids)
+        caption = anns[0]["caption"]
 
-        # Берем первую аннотацию (caption)
-        if len(anns) > 0:
-            caption = anns[0]["caption"]
-        else:
-            caption = "No caption available"
+        return {
+            "caption": caption,
+            "image": img
+        }
 
-        if self.transform:
-            img = self.transform(img)
-
-        return {"caption": caption, "image": img}
+    def restrict_to_subset(self, subset_size, seed=42):
+        if subset_size is None or subset_size >= len(self.ids):
+            return
+        rng = random.Random(seed)
+        ids_copy = self.ids[:]
+        rng.shuffle(ids_copy)
+        self.ids = ids_copy[:subset_size]
 
 
 if __name__ == "__main__":

@@ -143,15 +143,32 @@ class MoE(nn.Module):
         self._sov_id = special_tokens.get("sov_id")
         self._eov_id = special_tokens.get("eov_id")
         self._gate_distribution_history = defaultdict(dict)
+        self._gate_probability_history = defaultdict(dict)
+        self._probability_sums = defaultdict(dict)
+        self._probability_counts = defaultdict(dict)
+        self._last_overall_logged_step = -1
+        self._domain_last_logged_step = {}
         self._mlflow_logger = mlflow_logger
         self._visualizer : MoEVisualizer = visualizer
 
         self._log_gates = log_gates
+        self._suppress_gate_logging = False
         self._log_activations = log_activations
         self._log_frequency = log_frequency
+        self._log_overall_enabled = True
+        self._log_domain_enabled = True
 
     def set_global_step(self, global_step):
         self._global_step = global_step
+
+    def suppress_gate_logging(self, suppressed: bool):
+        self._suppress_gate_logging = suppressed
+
+    def set_logging_preferences(self, log_overall: Optional[bool] = None, log_domain: Optional[bool] = None):
+        if log_overall is not None:
+            self._log_overall_enabled = log_overall
+        if log_domain is not None:
+            self._log_domain_enabled = log_domain
 
 
     def forward(
@@ -160,6 +177,7 @@ class MoE(nn.Module):
         input_ids=None,
         temperature: Optional[float] = None,
         domain_id: Optional[str] = None,
+        sample_domains=None,
         bias: Optional[torch.Tensor] = None,
     ):
         device = hidden_states.device
@@ -198,10 +216,14 @@ class MoE(nn.Module):
         gate_idx, gate_score = self.gate(hidden_states_flat, temperature=temperature, bias=total_bias)
         overflowed_mask = (gate_idx[:, 0] == -1) & (gate_idx[:, 1] == -1)
         
+        # Convert global expert indices to local indices (0 to num_experts-1)
+        # GShardGate returns global indices (0 to tot_expert-1), but we need local (0 to num_experts-1)
+        gate_idx_local = gate_idx % self.num_experts
+        
         out_flat = torch.zeros(B, hidden_size, device=device, dtype=hidden_states.dtype)
         
         for k in range(self.top_k):
-            expert_indices = gate_idx[:, k]
+            expert_indices = gate_idx_local[:, k]  # Use local indices
             weights = gate_score[:, k]
             for expert_id in range(self.num_experts):
                 mask = (expert_indices == expert_id) & (~overflowed_mask)
@@ -217,17 +239,41 @@ class MoE(nn.Module):
 
         output = out_flat.view(batch_size, seq_len, hidden_size)
         self._step_count += 1
-        should_log = self._global_step % self._log_frequency == 0
-        if self._log_gates and should_log:
-            self._log_gate_distribution(gate_idx, gate_score.detach(), input_ids, domain_id=domain_id)
+        
+        should_log = (
+            self._log_gates 
+            and not self._suppress_gate_logging
+            and self._global_step % self._log_frequency == 0
+        )
+        if should_log:
+            # Use local indices for logging as well
+            self._log_gate_distribution(
+                gate_idx_local, gate_score.detach(), input_ids, 
+                batch_size=batch_size, seq_len=seq_len,
+                domain_id=domain_id, sample_domains=sample_domains
+            )
 
         return output
 
 
-    def _log_gate_distribution(self, gate_idx, gate_score, input_ids=None, domain_id=None):
+    def _log_gate_distribution(self, gate_idx, gate_score, input_ids=None, batch_size=None, seq_len=None, domain_id=None, sample_domains=None):
         modality = None
-        if isinstance(input_ids, torch.Tensor):
-            modality = self._get_token_modality(input_ids.view(-1))
+        if isinstance(input_ids, torch.Tensor) and input_ids.numel() > 0:
+            modality = self._get_token_modality(input_ids.view(-1))  # [B*L]
+        
+        # Определяем домен каждого токена по его позиции в батче
+        token_domains_flat = None
+        if sample_domains is not None and batch_size is not None and seq_len is not None:
+            # sample_domains[batch_idx] - домен сэмпла batch_idx
+            # Для токена с индексом token_idx в flatten представлении:
+            #   batch_idx = token_idx // seq_len
+            #   domain = sample_domains[batch_idx]
+            num_tokens = batch_size * seq_len
+            token_domains_flat = [None] * num_tokens
+            for token_idx in range(num_tokens):
+                batch_idx = token_idx // seq_len
+                if batch_idx < len(sample_domains):
+                    token_domains_flat[token_idx] = sample_domains[batch_idx]
         
         expert_counts = {}
         for expert_id in range(self.num_experts):
@@ -235,70 +281,182 @@ class MoE(nn.Module):
             expert_counts[expert_id] = count
         
         total_activations = sum(expert_counts.values())
+        domain_key = str(domain_id)
         
-        self._accumulate_history(self._gate_distribution_history['overall'], expert_counts)
-        self._save_distribution_to_json(expert_counts, "overall")
+        if self._global_step <= 2:
+            print(f"[Layer {self._layer_id}] _log_gate_distribution: domain_id={domain_id}, sample_domains={sample_domains}")
+            if token_domains_flat:
+                unique_domains = set(d for d in token_domains_flat if d is not None)
+                print(f"[Layer {self._layer_id}] Unique token domains: {unique_domains}")
+
+        accumulate_overall = self._log_overall_enabled
+        emit_overall = (
+            accumulate_overall
+            and self._last_overall_logged_step != self._global_step
+        )
+        log_domain = (
+            self._log_domain_enabled
+            and domain_key is not None
+            and self._domain_last_logged_step.get(domain_key) != self._global_step
+        )
+        
+        print(f"[Layer {self._layer_id}] accumulate_overall={accumulate_overall}, emit_overall={emit_overall}, log_domain={log_domain}")
+
+        if not accumulate_overall and not log_domain:
+            print(f"[Layer {self._layer_id}] Skipping logging (no accumulate/log flags)")
+            return
         
         text_expert_counts = None
         image_expert_counts = None
-        
-        if modality is not None:
-            text_mask = (modality == 0)
-            image_mask = (modality == 1)
-            video_mask = (modality == 2)
-            
-            modalities = [
-                ("text", text_mask),
-                ("image", image_mask),
-                ("video", video_mask)
-            ]
-            
-            for modality_name, mask in modalities:
-                modality_gate_idx = gate_idx[mask]
-                modality_gate_score = gate_score[mask]
-                modality_expert_counts = {}
-                for expert_id in range(self.num_experts):
-                    count = (modality_gate_idx == expert_id).sum().item()
-                    modality_expert_counts[expert_id] = count
-                
-                modality_total = sum(modality_expert_counts.values())
-                
-                self._accumulate_history(self._gate_distribution_history[modality_name], modality_expert_counts)
-                self._save_distribution_to_json(modality_expert_counts, modality_name)
-                
-                if modality_name == "text":
-                    text_expert_counts = modality_expert_counts
-                elif modality_name == "image":
-                    image_expert_counts = modality_expert_counts
-                
-                self._log_to_mlflow_modality_gates(
-                    modality_expert_counts, modality_total, modality_gate_score, modality_name
-                )
-                    
-                        
-        
-        if total_activations > 0:
-            self._log_to_mlflow_gates(expert_counts, total_activations, gate_score)
-        
-        if domain_id is not None:
-            self._ensure_domain_buffer(domain_id)
-        if domain_id is not None:
-            domain_expert_counts = {}
-            for expert_id in range(self.num_experts):
-                count = (gate_idx == expert_id).sum().item()
-                domain_expert_counts[expert_id] = count
-            
-            self._accumulate_history(self._gate_distribution_history[domain_id], domain_expert_counts)
-            self._save_distribution_to_json(domain_expert_counts, f"domain_{domain_id}")
-        
 
-        self._log_all_plots_to_mlflow(
-            overall_expert_counts=expert_counts,
-            overall_gate_score=gate_score,
-            text_expert_counts=text_expert_counts,
-            image_expert_counts=image_expert_counts,
-            domain_id=domain_id
-        )
+        if accumulate_overall:
+            self._accumulate_history(self._gate_distribution_history["overall"], expert_counts)
+            overall_probs, overall_weight = self._compute_average_gate_probs(gate_idx, gate_score)
+            self._store_probability(
+                history_dict=self._gate_probability_history["overall"],
+                history_key="overall",
+                probs=overall_probs,
+                weight=overall_weight,
+                finalize=emit_overall,
+            )
+            if emit_overall:
+                self._save_distribution_to_json(expert_counts, "overall")
+
+            if modality is not None:
+                text_mask = modality == 0
+                image_mask = modality == 1
+                video_mask = modality == 2
+
+                modalities = [
+                    ("text", text_mask),
+                    ("image", image_mask),
+                    ("video", video_mask),
+                ]
+
+                for modality_name, mask in modalities:
+                    if not mask.any():
+                        continue
+                    modality_gate_idx = gate_idx[mask]
+                    modality_gate_score = gate_score[mask]
+                    modality_expert_counts = {}
+                    for expert_id in range(self.num_experts):
+                        count = (modality_gate_idx == expert_id).sum().item()
+                        modality_expert_counts[expert_id] = count
+
+                    modality_total = sum(modality_expert_counts.values())
+
+                    self._accumulate_history(
+                        self._gate_distribution_history[modality_name], modality_expert_counts
+                    )
+                    if emit_overall:
+                        self._save_distribution_to_json(modality_expert_counts, modality_name)
+
+                    if modality_name == "text":
+                        text_expert_counts = modality_expert_counts
+                    elif modality_name == "image":
+                        image_expert_counts = modality_expert_counts
+
+                    modality_probs, modality_weight = self._compute_average_gate_probs(
+                        modality_gate_idx, modality_gate_score
+                    )
+                    self._store_probability(
+                        history_dict=self._gate_probability_history[modality_name],
+                        history_key=modality_name,
+                        probs=modality_probs,
+                        weight=modality_weight,
+                        finalize=emit_overall,
+                    )
+
+                    if emit_overall:
+                        self._log_to_mlflow_modality_gates(
+                            modality_expert_counts, modality_total, modality_gate_score, modality_name
+                        )
+
+            if total_activations > 0 and emit_overall:
+                self._log_to_mlflow_gates(expert_counts, total_activations, gate_score)
+
+        # Process per-domain statistics from sample_domains
+        # Простая логика: для каждого уникального домена в sample_domains собираем статистику
+        # ВАЖНО: делаем это ДО вызова _log_all_plots_to_mlflow, чтобы домены были в history
+        if token_domains_flat is not None and len(token_domains_flat) > 0:
+            unique_domains = set(d for d in token_domains_flat if d is not None)
+            if self._global_step <= 2:
+                print(f"[Layer {self._layer_id}] Found unique domains in sample_domains: {unique_domains}")
+            
+            for domain_name in unique_domains:
+                # Создаем маску для токенов этого домена
+                domain_mask = torch.tensor(
+                    [d == domain_name for d in token_domains_flat],
+                    dtype=torch.bool,
+                    device=gate_idx.device
+                )
+                
+                if not domain_mask.any():
+                    continue
+                
+                # Фильтруем gate_idx и gate_score только для токенов этого домена
+                domain_gate_idx = gate_idx[domain_mask]
+                domain_gate_score = gate_score[domain_mask]
+                
+                # Подсчитываем активации экспертов для этого домена
+                domain_expert_counts = {}
+                for expert_id in range(self.num_experts):
+                    count = (domain_gate_idx == expert_id).sum().item()
+                    domain_expert_counts[expert_id] = count
+                
+                domain_key_str = str(domain_name)
+                should_log_this_domain = self._domain_last_logged_step.get(domain_key_str) != self._global_step
+                
+                if should_log_this_domain:
+                    if self._global_step <= 2:
+                        print(f"[Layer {self._layer_id}] Logging domain: {domain_key_str}, counts={domain_expert_counts}")
+                    self._ensure_domain_buffer(domain_key_str)
+                    self._accumulate_history(
+                        self._gate_distribution_history[domain_key_str], domain_expert_counts
+                    )
+                    domain_probs, domain_weight = self._compute_average_gate_probs(domain_gate_idx, domain_gate_score)
+                    self._store_probability(
+                        history_dict=self._gate_probability_history[domain_key_str],
+                        history_key=f"domain_{domain_key_str}",
+                        probs=domain_probs,
+                        weight=domain_weight,
+                        finalize=True,
+                    )
+                    self._save_distribution_to_json(domain_expert_counts, domain_key_str)
+                    self._log_to_mlflow_gates(domain_expert_counts, sum(domain_expert_counts.values()), domain_gate_score)
+                    self._domain_last_logged_step[domain_key_str] = self._global_step
+
+        # Теперь вызываем _log_all_plots_to_mlflow ПОСЛЕ обработки всех доменов
+        if accumulate_overall and emit_overall:
+            self._log_all_plots_to_mlflow(
+                overall_expert_counts=expert_counts,
+                overall_gate_score=gate_score,
+                text_expert_counts=text_expert_counts,
+                image_expert_counts=image_expert_counts,
+                domain_id=domain_key,
+            )
+            self._last_overall_logged_step = self._global_step
+        
+        # Legacy: also process domain_id if provided (for backward compatibility)
+        if log_domain and domain_key is not None:
+            print(f"[Layer {self._layer_id}] Logging domain from domain_id: {domain_key}")
+            self._ensure_domain_buffer(domain_key)
+            domain_expert_counts = expert_counts.copy()
+            self._accumulate_history(
+                self._gate_distribution_history[domain_key], domain_expert_counts
+            )
+            print(f"[Layer {self._layer_id}] Domain {domain_key} history after accumulate: {self._gate_distribution_history[domain_key]}")
+            domain_probs, domain_weight = self._compute_average_gate_probs(gate_idx, gate_score)
+            self._store_probability(
+                history_dict=self._gate_probability_history[domain_key],
+                history_key=f"domain_{domain_key}",
+                probs=domain_probs,
+                weight=domain_weight,
+                finalize=True,
+            )
+            self._save_distribution_to_json(domain_expert_counts, f"domain_{domain_key}")
+            self._domain_last_logged_step[domain_key] = self._global_step
+            print(f"[Layer {self._layer_id}] Domain {domain_key} logged, _domain_last_logged_step={self._domain_last_logged_step}")
     
     
     def _log_all_plots_to_mlflow(self, overall_expert_counts, 
@@ -331,8 +489,12 @@ class MoE(nn.Module):
                 domain_id, domain_history, self._global_step, current_expert_counts
             )
         
+        print(f"[Layer {self._layer_id}] Creating all_domains plot, history keys: {list(self._gate_distribution_history.keys())}")
         all_domains_plot_bytes = self._visualizer.create_all_domains_combined_plot(
             self._gate_distribution_history, self._global_step
+        )
+        modality_prob_plot_bytes = self._visualizer.create_modality_probability_plot(
+            self._gate_probability_history, self._global_step
         )
         
         self._mlflow_logger.log_all_plots(
@@ -343,6 +505,7 @@ class MoE(nn.Module):
             combined_plot_bytes=combined_plot_bytes,
             domain_plot_bytes=domain_plot_bytes,
             all_domains_plot_bytes=all_domains_plot_bytes,
+            modality_probability_plot_bytes=modality_prob_plot_bytes,
             domain_id=domain_id
         )
     
@@ -354,14 +517,98 @@ class MoE(nn.Module):
             for expert_id, count in counts.items():
                 existing[expert_id] = existing.get(expert_id, 0) + count
 
+    def _compute_average_gate_probs(self, gate_idx, gate_score, token_mask=None):
+        num_tokens = gate_idx.shape[0]
+        if num_tokens == 0:
+            return None, 0.0
+
+        if token_mask is None:
+            mask = torch.ones(num_tokens, dtype=torch.bool, device=gate_idx.device)
+        else:
+            mask = token_mask.to(device=gate_idx.device)
+            if mask.dtype != torch.bool:
+                mask = mask.bool()
+            if mask.shape[0] != num_tokens:
+                mask = mask.view(num_tokens)
+
+        expert_valid = (gate_idx >= 0) & (gate_idx < self.num_experts)
+        expanded_mask = mask.unsqueeze(1).expand_as(expert_valid)
+        valid = expanded_mask & expert_valid
+
+        if not valid.any():
+            return None, 0.0
+
+        cleaned_scores = torch.where(valid, gate_score, torch.zeros_like(gate_score))
+        token_sums = cleaned_scores.sum(dim=1, keepdim=True)
+        token_has_valid = (token_sums.squeeze(-1) > 0)
+        if not token_has_valid.any():
+            return None, 0.0
+
+        token_sums = torch.where(token_sums > 0, token_sums, torch.ones_like(token_sums))
+        normalized_scores = cleaned_scores / token_sums
+
+        probs = torch.zeros(self.num_experts, device=gate_idx.device, dtype=gate_score.dtype)
+        for k in range(self.top_k):
+            expert_ids = gate_idx[:, k]
+            weights = normalized_scores[:, k]
+            valid_k = token_has_valid & expert_valid[:, k]
+            if valid_k.any():
+                probs.scatter_add_(0, expert_ids[valid_k], weights[valid_k])
+
+        denom = token_has_valid.sum()
+        if denom.item() == 0:
+            return None, 0.0
+        probs = probs / denom
+        return probs, float(denom.item())
+
+    def _store_probability(self, history_dict, history_key, probs, weight, finalize):
+        if probs is None or weight <= 0.0:
+            return
+        probs_cpu = probs.detach().to("cpu")
+
+        step = self._global_step
+        sums = self._probability_sums[history_key]
+        counts = self._probability_counts[history_key]
+        if step in sums:
+            sums[step] = sums[step] + probs_cpu * weight
+        else:
+            sums[step] = probs_cpu * weight
+        counts[step] = counts.get(step, 0.0) + weight
+
+        if not finalize:
+            return
+
+        total_weight = counts.pop(step, 0.0)
+        sum_vec = sums.pop(step, None)
+        if sum_vec is None or total_weight <= 0.0:
+            return
+
+        final_vec = sum_vec / total_weight
+        norm = final_vec.sum().item()
+        if norm <= 0:
+            return
+        final_vec = final_vec / norm
+        history_dict[step] = final_vec
+
+    def _update_prob_ema(self, key, new_probs):
+        if new_probs is None:
+            return
+        new_probs_cpu = new_probs.detach().to("cpu")
+        existing = self._gate_probability_ema.get(key)
+        if existing is None:
+            self._gate_probability_ema[key] = new_probs_cpu
+        else:
+            self._gate_probability_ema[key] = (
+                self.prob_ema_decay * existing + (1.0 - self.prob_ema_decay) * new_probs_cpu
+            )
+
 
     def set_global_step(self, global_step):
         self._global_step = global_step
         
     def get_balance_loss(self, clear=True):
         gate_loss =  self.gate.get_loss(clear=clear)
-        orthogonal_loss = torch.zeros_like(gate_loss)
-        return gate_loss, orthogonal_loss
+        return gate_loss
         
 
     def _ensure_domain_buffer(self, domain_id: str):

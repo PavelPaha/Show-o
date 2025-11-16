@@ -530,6 +530,7 @@ def log_training_metrics(
     avg_loss_mmu,
     balance_loss,
     balance_coeff,
+    orthogonal_loss,
     avg_masking_rate,
     lr_scheduler,
     batch_time_m,
@@ -542,11 +543,15 @@ def log_training_metrics(
 ):
     all_lrs = lr_scheduler.get_last_lr()
 
-    logs = {
+    loss_logs = {
         "step_loss_t2i": avg_loss_t2i.item(),
         "step_loss_mmu": avg_loss_mmu.item(),
         "step_loss_lm": avg_loss_lm.item(),
         "step_loss_balance": balance_loss.item(),
+    }
+    logs = {
+        **loss_logs,
+        "orthogonal_loss": orthogonal_loss.item(),
         "balance_coeff": balance_coeff,
         "avg_masking_rate": avg_masking_rate.item(),
         "samples/sec/gpu": samples_per_second_per_gpu,
@@ -564,8 +569,9 @@ def log_training_metrics(
         logs["lr"] = all_lrs[0]
 
     if mlflow_client is not None and mlflow_run_id is not None:
+        non_loss_logs = {k: v for k, v in logs.items() if not k.startswith("step_loss")}
         try:
-            for metric_name, metric_value in logs.items():
+            for metric_name, metric_value in non_loss_logs.items():
                 mlflow_client.log_metric(
                     mlflow_run_id, metric_name, metric_value, step=global_step
                 )

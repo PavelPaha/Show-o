@@ -29,7 +29,6 @@ class MoEMLflowLogger:
     def log_gate_metrics(self, layer_id: int, global_step: int, 
                         expert_counts: Dict[int, int], total_activations: int, 
                         gate_score_mean: float, gate_score_std: float):
-        """Логирует метрики гейтов для overall"""
         client, run_id = self.get_client_and_run_id()
         if client is None or run_id is None:
             return
@@ -63,6 +62,7 @@ class MoEMLflowLogger:
                      combined_plot_bytes: bytes,
                      domain_plot_bytes: Optional[bytes] = None,
                      all_domains_plot_bytes: Optional[bytes] = None,
+                     modality_probability_plot_bytes: Optional[bytes] = None,
                      domain_id: Optional[str] = None):
         """Логирует все графики в MLflow за один раз"""
         client, run_id = self.get_client_and_run_id()
@@ -102,11 +102,19 @@ class MoEMLflowLogger:
                 client.log_artifact(run_id, tmp_file, layer_prefix)
                 logger.info(f"📊 График для домена {domain_id} отправлен в MLflow: {layer_prefix}/gate_distribution_domain_{domain_id}_step_{global_step}.png")
             
-            tmp_file = os.path.join(temp_dir, f"gate_distribution_all_domains_step_{global_step}.png")
-            with open(tmp_file, 'wb') as f:
-                f.write(all_domains_plot_bytes)
-            client.log_artifact(run_id, tmp_file, layer_prefix)
-            logger.info(f"📊 Общий график всех доменов отправлен в MLflow: {layer_prefix}/gate_distribution_all_domains_step_{global_step}.png")
+            if all_domains_plot_bytes is not None:
+                tmp_file = os.path.join(temp_dir, f"gate_distribution_all_domains_step_{global_step}.png")
+                with open(tmp_file, 'wb') as f:
+                    f.write(all_domains_plot_bytes)
+                client.log_artifact(run_id, tmp_file, layer_prefix)
+                logger.info(f"📊 Общий график всех доменов отправлен в MLflow: {layer_prefix}/gate_distribution_all_domains_step_{global_step}.png")
+            
+            if modality_probability_plot_bytes is not None:
+                tmp_file = os.path.join(temp_dir, f"gate_distribution_modalities_probs_step_{global_step}.png")
+                with open(tmp_file, 'wb') as f:
+                    f.write(modality_probability_plot_bytes)
+                client.log_artifact(run_id, tmp_file, layer_prefix)
+                logger.info(f"📊 Средние вероятности по модальностям отправлены в MLflow: {layer_prefix}/gate_distribution_modalities_probs_step_{global_step}.png")
         
         except Exception as e:
             logger.error(f"❌ Ошибка логирования графиков: {e}")
@@ -140,14 +148,14 @@ class MoEMLflowLogger:
                    os.unlink(tmp_file_path)
                    os.rmdir(temp_dir)
     
-    def log_layer_expert_heatmap(self, global_step: int, heatmap_bytes: bytes):
+    def log_layer_expert_heatmap(self, global_step: int, heatmap_bytes: bytes, suffix='all_tokens'):
         """Логирует heatmap активации экспертов по слоям"""
         client, run_id = self.get_client_and_run_id()
         if client is None or run_id is None:
             return
         
         temp_dir = tempfile.mkdtemp()
-        filename = f"expert_activation_frequency_layers_step_{global_step}.png"
+        filename = f"expert_activation_frequency_layers_step_{suffix}_{global_step}.png"
         tmp_file_path = os.path.join(temp_dir, filename)
         
         try:
@@ -157,6 +165,26 @@ class MoEMLflowLogger:
             logger.info(f"📊 Heatmap активации экспертов по слоям отправлена в MLflow: moe/{filename}")
         except Exception as e:
             logger.error(f"❌ Ошибка логирования heatmap слои×эксперты: {e}")
+        finally:
+            os.unlink(tmp_file_path)
+            os.rmdir(temp_dir)
+
+    def log_layer_probability_heatmap(self, global_step: int, heatmap_bytes: bytes, suffix='overall'):
+        client, run_id = self.get_client_and_run_id()
+        if client is None or run_id is None:
+            return
+
+        temp_dir = tempfile.mkdtemp()
+        filename = f"expert_activation_prob_layers_step_{suffix}_{global_step}.png"
+        tmp_file_path = os.path.join(temp_dir, filename)
+
+        try:
+            with open(tmp_file_path, 'wb') as f:
+                f.write(heatmap_bytes)
+            client.log_artifact(run_id, tmp_file_path, "moe")
+            logger.info(f"📊 Heatmap вероятностей по слоям отправлена в MLflow: moe/{filename}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка логирования probability heatmap: {e}")
         finally:
             os.unlink(tmp_file_path)
             os.rmdir(temp_dir)

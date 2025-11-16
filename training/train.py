@@ -1,4 +1,5 @@
 import os
+import copy
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 import sys
@@ -50,6 +51,8 @@ from training.eval_utils import (
     log_training_metrics,
     evaluate_mmu,
 )
+from benchmark.coco_dataset import COCODataset
+from benchmark.benchmark import ShowoBenchmark
 from training.dataset_utils import create_dataloaders
 from training.checkpoint_utils import save_checkpoint
 from training.utils import (
@@ -93,6 +96,38 @@ def prepare_inputs_and_labels(
     return input_ids, labels, mask_prob, image_tokens
 
 
+def set_moe_layers_global_step(model, accelerator, step_value):
+    try:
+        unwrapped_model = accelerator.unwrap_model(model)
+    except Exception:
+        unwrapped_model = model
+
+    if not hasattr(unwrapped_model, "showo"):
+        return
+
+    model_layers = getattr(unwrapped_model.showo.model, "layers", [])
+    for layer in model_layers:
+        if hasattr(layer, "mlp") and hasattr(layer.mlp, "set_global_step"):
+            layer.mlp.set_global_step(step_value)
+
+
+def set_moe_layers_logging_preferences(model, accelerator, log_overall=None, log_domain=None):
+    try:
+        unwrapped_model = accelerator.unwrap_model(model)
+    except Exception:
+        unwrapped_model = model
+
+    if not hasattr(unwrapped_model, "showo"):
+        return
+
+    model_layers = getattr(unwrapped_model.showo.model, "layers", [])
+    for layer in model_layers:
+        mlp = getattr(layer, "mlp", None)
+        if mlp is None or not hasattr(mlp, "set_logging_preferences"):
+            continue
+        mlp.set_logging_preferences(log_overall=log_overall, log_domain=log_domain)
+
+
 def train_step(
     batch,
     epoch,
@@ -118,8 +153,6 @@ def train_step(
 ):
     batch_size_t2i = batch["t2i_flow"]["images"].shape[0]
     batch_size_lm = len(batch["lm_flow"]["input_ids"])
-    
-    # Определяем доменные flow'ы и их приоритет (порядок важен!)
     domain_flows = [
         "vqav2_experiments_flow",
         "textvqa_experiments_flow",
@@ -130,16 +163,10 @@ def train_step(
         "kvasir_flow",
     ]
     
-    batch_size_mmu = batch["mmu_flow"]["images"].shape[0]
+    # Will be updated after collecting all domain data
+    batch_size_mmu = 0
     domain_id = None
     domain_ids = []
-    
-    for flow_key in domain_flows:
-        if flow_key in batch:
-            if domain_id is None:  # Первый найденный домен
-                batch_size_mmu = batch[flow_key]["images"].shape[0]
-                domain_id = flow_key[:-5]
-            domain_ids.append(flow_key[:-5])
     
 
     # Build T2I sequences
@@ -182,40 +209,61 @@ def train_step(
     labels = torch.cat((labels_t2i, labels_lm.to(input_ids_t2i.device)), dim=0)
 
     present_domain_flows = [flow_key for flow_key in domain_flows if flow_key in batch]
-    mmu_flow_key = "mmu_flow"
+    
+    
+    # Collect MMU data from all present domain flows
+    all_mmu_input_ids = []
+    all_mmu_labels = []
+    all_mmu_attention_masks = []
+    mmu_domain_assignments = []  # track which domain each MMU sample belongs to
+    
     if present_domain_flows:
-        mmu_flow_key = present_domain_flows[0]
-    
-    is_domain_flow = mmu_flow_key in domain_flows
-    
-    if "llava" in config.dataset.und_type or is_domain_flow:
-        pixel_values_mmu, input_ids_mmu, labels_mmu = (
-            batch[mmu_flow_key]["images"],
-            batch[mmu_flow_key]["input_ids"],
-            batch[mmu_flow_key]["labels"],
-        )
-        pixel_values_mmu = pixel_values_mmu.to(accelerator.device, non_blocking=True)
-        input_ids_mmu = input_ids_mmu.to(accelerator.device, non_blocking=True)
-        image_tokens_mmu = vq_model.get_code(pixel_values_mmu)
-        image_tokens_mmu = image_tokens_mmu + len(uni_prompting.text_tokenizer)
-
-        input_ids_mmu = torch.cat([
-            (torch.ones(input_ids_mmu.shape[0], 1) * uni_prompting.sptids_dict['<|mmu|>']).to(accelerator.device),
-            (torch.ones(input_ids_mmu.shape[0], 1) * uni_prompting.sptids_dict['<|soi|>']).to(accelerator.device),
-            image_tokens_mmu,
-            (torch.ones(input_ids_mmu.shape[0], 1) * uni_prompting.sptids_dict['<|eoi|>']).to(accelerator.device),
-            input_ids_mmu,
-        ], dim=1).long()
-
-        labels_mmu = torch.cat([
-            (torch.ones(input_ids_mmu.shape[0], 1) * uni_prompting.ignore_id).to(accelerator.device),
-            (torch.ones(input_ids_mmu.shape[0], 1) * uni_prompting.ignore_id).to(accelerator.device),
-            torch.ones_like(image_tokens_mmu) * uni_prompting.ignore_id,
-            (torch.ones(input_ids_mmu.shape[0], 1) * uni_prompting.ignore_id).to(accelerator.device),
-            labels_mmu.to(accelerator.device)
-        ], dim=1).long()
-
-    else:
+        # Process each domain flow
+        for flow_key in present_domain_flows:
+            
+            flow_domain = flow_key[:-5]
+            pixel_values_domain = batch[flow_key]["images"].to(accelerator.device, non_blocking=True)
+            input_ids_domain = batch[flow_key]["input_ids"].to(accelerator.device, non_blocking=True)
+            labels_domain = batch[flow_key]["labels"].to(accelerator.device, non_blocking=True)
+            
+            image_tokens_domain = vq_model.get_code(pixel_values_domain)
+            image_tokens_domain = image_tokens_domain + len(uni_prompting.text_tokenizer)
+            
+            input_ids_domain_proc = torch.cat([
+                (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.sptids_dict['<|mmu|>']).to(accelerator.device),
+                (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.sptids_dict['<|soi|>']).to(accelerator.device),
+                image_tokens_domain,
+                (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.sptids_dict['<|eoi|>']).to(accelerator.device),
+                input_ids_domain,
+            ], dim=1).long()
+            
+            labels_domain_proc = torch.cat([
+                (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.ignore_id).to(accelerator.device),
+                (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.ignore_id).to(accelerator.device),
+                torch.ones_like(image_tokens_domain) * uni_prompting.ignore_id,
+                (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.ignore_id).to(accelerator.device),
+                labels_domain.to(accelerator.device)
+            ], dim=1).long()
+            
+            attention_mask_domain = create_attention_mask_for_mmu(
+                input_ids_domain_proc,
+                eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
+            ).to(mask_dtype)
+            
+            all_mmu_input_ids.append(input_ids_domain_proc)
+            all_mmu_labels.append(labels_domain_proc)
+            all_mmu_attention_masks.append(attention_mask_domain)
+            mmu_domain_assignments.extend([flow_domain] * input_ids_domain_proc.shape[0])
+        
+        # Concatenate all domain data
+        input_ids_mmu = torch.cat(all_mmu_input_ids, dim=0)
+        labels_mmu = torch.cat(all_mmu_labels, dim=0)
+        attention_mask_mmu = torch.cat(all_mmu_attention_masks, dim=0)
+        batch_size_mmu = input_ids_mmu.shape[0]
+        domain_id = present_domain_flows[0][:-5]  # use first domain as primary
+        domain_ids = [flow[:-5] for flow in present_domain_flows]
+    elif "llava" in config.dataset.und_type:
+        # Fallback to mmu_flow
         pixel_values_mmu, texts_mmu = (
             batch["mmu_flow"]["images"],
             batch["mmu_flow"]["input_ids"],
@@ -227,12 +275,20 @@ def train_step(
             (image_tokens_mmu, texts_mmu), "mmu"
         )
         input_ids_mmu = input_ids_mmu.to(accelerator.device, non_blocking=True)
-
-    attention_mask_mmu = create_attention_mask_for_mmu(
-        input_ids_mmu.to(input_ids.device),
-        eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
-    )
-    attention_mask_mmu = attention_mask_mmu.to(mask_dtype)
+        labels_mmu = labels_mmu.to(accelerator.device)
+        attention_mask_mmu = create_attention_mask_for_mmu(
+            input_ids_mmu,
+            eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
+        ).to(mask_dtype)
+        mmu_domain_assignments = [None] * input_ids_mmu.shape[0]
+        batch_size_mmu = input_ids_mmu.shape[0]
+    else:
+        # No MMU data
+        input_ids_mmu = torch.empty((0, input_ids.shape[1]), dtype=input_ids.dtype, device=input_ids.device)
+        labels_mmu = torch.empty((0, labels.shape[1]), dtype=labels.dtype, device=labels.device)
+        attention_mask_mmu = torch.empty((0, 1, 0, 0), dtype=mask_dtype, device=attention_mask.device)
+        mmu_domain_assignments = []
+        batch_size_mmu = 0
     
     # Debug: log shapes on first step
     if global_step == 0 and epoch == 0:
@@ -263,6 +319,19 @@ def train_step(
     attention_mask = torch.cat([attention_mask, attention_mask_mmu], dim=0)
     input_ids = torch.cat((input_ids, input_ids_mmu.to(input_ids.device)), dim=0)
     labels = torch.cat((labels, labels_mmu.to(input_ids.device)), dim=0)
+    
+    # Create sample_domains: simple list where each element is the domain of that sample
+    # [batch_size] where each element is domain name (None for T2I/LM, domain name for MMU)
+    batch_size_total = input_ids.shape[0]
+    sample_domains = (
+        [None] * batch_size_t2i +           # T2I samples
+        [None] * batch_size_lm +            # LM samples  
+        mmu_domain_assignments              # MMU samples with their domains
+    )
+    
+    if global_step <= 2:
+        logger.info(f"Step {global_step}: sample_domains = {sample_domains}")
+        logger.info(f"Step {global_step}: batch sizes: t2i={batch_size_t2i}, lm={batch_size_lm}, mmu={len(mmu_domain_assignments)}, total={batch_size_total}")
 
     if global_step == 0 and epoch == 0:
         logger.info(f"📊 First training step diagnostics:")
@@ -272,61 +341,13 @@ def train_step(
         logger.info(f"   mask_id used: {mask_id}")
         logger.info(f"   text_tokenizer size: {len(uni_prompting.text_tokenizer)}")
         logger.info(f"   Expected image token range: [{len(uni_prompting.text_tokenizer)}, {len(uni_prompting.text_tokenizer) + 8192 - 1}]")
-        # logger.info("Input ids: {}".format(input_ids))
-        # logger.info("Labels: {}".format(labels))
 
     current_temperature = temp_scheduler.get_last_lr()[0]
-    if len(present_domain_flows) >= 1 and config.get("moe", {}).get("enabled", False):
-        unwrapped_model = accelerator.unwrap_model(model)
-        
-        # Обрабатываем каждый домен отдельно для сбора gate distributions
-        # Важно: обрабатываем ВСЕ домены из present_domain_flows
-        for flow_key in present_domain_flows:
-            flow_domain_id = flow_key[:-5]  # Преобразуем flow_key в domain_id (убираем "_flow")
-            # Обрабатываем этот домен отдельно для логирования
-            pixel_values_domain = batch[flow_key]["images"].to(accelerator.device, non_blocking=True)
-            input_ids_domain = batch[flow_key]["input_ids"].to(accelerator.device, non_blocking=True)
-            labels_domain = batch[flow_key]["labels"].to(accelerator.device, non_blocking=True)
-            
-            image_tokens_domain = vq_model.get_code(pixel_values_domain)
-            image_tokens_domain = image_tokens_domain + len(uni_prompting.text_tokenizer)
-            
-            input_ids_domain_processed = torch.cat([
-                (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.sptids_dict['<|mmu|>']).to(accelerator.device),
-                (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.sptids_dict['<|soi|>']).to(accelerator.device),
-                image_tokens_domain,
-                (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.sptids_dict['<|eoi|>']).to(accelerator.device),
-                input_ids_domain,
-            ], dim=1).long()
-            
-            labels_domain_processed = torch.cat([
-                (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.ignore_id).to(accelerator.device),
-                (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.ignore_id).to(accelerator.device),
-                torch.ones_like(image_tokens_domain) * uni_prompting.ignore_id,
-                (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.ignore_id).to(accelerator.device),
-                labels_domain,
-            ], dim=1).long()
-            
-            attention_mask_domain = create_attention_mask_for_mmu(
-                input_ids_domain_processed.to(input_ids.device),
-                eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
-            ).to(mask_dtype)
-            
-            with torch.set_grad_enabled(False):
-                _ = model(
-                    input_ids=input_ids_domain_processed,
-                    input_embeddings=None,
-                    attention_mask=attention_mask_domain,
-                    labels=labels_domain_processed,
-                    label_smoothing=config.training.label_smoothing,
-                    batch_size_t2i=0,
-                    batch_size_lm=0,
-                    batch_size_mmu=input_ids_domain_processed.shape[0],
-                    max_seq_length=config.dataset.preprocessing.max_seq_length,
-                    moe_temperature=current_temperature,
-                    moe_domain_id=flow_domain_id,
-                )
-    
+    should_log_layer_expert = global_step % config.experiment["generate_every"] == 0
+    if config.get("moe", {}).get("enabled", False):
+        set_moe_layers_global_step(model, accelerator, global_step)
+
+
     logits, loss_t2i, loss_lm, loss_mmu = model(
         input_ids=input_ids,
         input_embeddings=None,
@@ -339,6 +360,7 @@ def train_step(
         max_seq_length=config.dataset.preprocessing.max_seq_length,
         moe_temperature=current_temperature,
         moe_domain_id=domain_id,
+        moe_sample_domains=sample_domains,
     )
     
 
@@ -353,33 +375,67 @@ def train_step(
         loss_mmu.repeat(config.training.batch_size_mmu)
     ).mean()
 
-    balance_loss, num_moe_layers = collect_moe_balance_losses(model)
+    balance_loss, orthogonal_loss, num_moe_layers = collect_moe_balance_losses(model)
     if num_moe_layers == 0:
         logger.warning(f"⚠️ MoE enabled but num_moe_layers = {num_moe_layers}")
         
     balance_coeff = balance_scheduler.get_last_lr()[0]
-    should_log_layer_expert = (global_step + 1) % config.experiment['generate_every'] == 0
-    if should_log_layer_expert and mlflow_client is not None and mlflow_run_id is not None:
+
+    if (
+        should_log_layer_expert
+        and accelerator.is_main_process
+        and mlflow_client is not None
+        and mlflow_run_id is not None
+    ):
         unwrapped_model = accelerator.unwrap_model(model)
         collector = LayerExpertStatsCollector(unwrapped_model)
-        layer_expert_counts = collector.collect()
+        layer_expert_counts_by_modality, probability_map = collector.collect(global_step)
         
-        if not layer_expert_counts:
+        if not layer_expert_counts_by_modality:
             raise Exception("No moe layers")
         visualizer = MoEVisualizer(num_experts=config.moe.num_experts)
-        heatmap_bytes = visualizer.create_layer_expert_activation_heatmap(
-            layer_expert_counts, global_step=global_step + 1
-        )
-        
         mlflow_logger = MoEMLflowLogger(mlflow_client=mlflow_client, mlflow_run_id=mlflow_run_id)
-        mlflow_logger.log_layer_expert_heatmap(global_step + 1, heatmap_bytes)
+        # print(f'{layer_expert_counts_by_modality=}')
+        
+        for modality, layer_expert_counts in layer_expert_counts_by_modality.items():
+            print(f'[layer_expert_counts_by_modality] {modality=}, {layer_expert_counts=}')
+            heatmap_bytes = visualizer.create_layer_expert_activation_heatmap(
+                layer_expert_counts, global_step=global_step + 1
+            )
+            mlflow_logger.log_layer_expert_heatmap(global_step + 1, heatmap_bytes, suffix=modality)
+
+        for modality, layer_probabilities in probability_map.items():
+            print(f'[probability_map] {modality=}, {layer_expert_counts=}')
+            prob_heatmap = visualizer.create_layer_probability_heatmap(
+                layer_probabilities, modality, global_step
+            )
+            mlflow_logger.log_layer_probability_heatmap(
+                global_step + 1, prob_heatmap, suffix=modality
+            )
 
     loss = (
         config.training.t2i_coeff * loss_t2i
         + config.training.lm_coeff * loss_lm
         + config.training.mmu_coeff * loss_mmu
         + balance_coeff * balance_loss
+        + config.training.orthogonal_coeff * orthogonal_loss
     )
+
+    if accelerator.is_main_process and mlflow_client is not None and mlflow_run_id is not None:
+        step_idx = global_step + 1
+        loss_metrics = {
+            "loss/total": loss.item(),
+            "loss/t2i": avg_loss_t2i.item(),
+            "loss/lm": avg_loss_lm.item(),
+            "loss/mmu": avg_loss_mmu.item(),
+            "loss/balance": balance_loss.item(),
+            "loss/orthogonal": orthogonal_loss.item(),
+        }
+        try:
+            for metric_name, metric_value in loss_metrics.items():
+                mlflow_client.log_metric(mlflow_run_id, metric_name, metric_value, step=step_idx)
+        except Exception as logging_err:
+            logger.warning(f"Failed to log per-step losses to MLflow: {logging_err}")
 
     avg_masking_rate = accelerator.gather(
         mask_prob.repeat(config.training.batch_size_t2i)
@@ -416,6 +472,7 @@ def train_step(
     if (
         accelerator.sync_gradients
         and (global_step + 1) % config.experiment.log_every == 0
+        and accelerator.is_main_process
     ):
         samples_per_second_per_gpu = (
             config.training.gradient_accumulation_steps
@@ -428,6 +485,7 @@ def train_step(
             avg_loss_mmu=avg_loss_mmu,
             balance_loss=balance_loss,
             balance_coeff=balance_coeff,
+            orthogonal_loss=orthogonal_loss,
             avg_masking_rate=avg_masking_rate,
             lr_scheduler=lr_scheduler,
             batch_time_m=batch_time_m,
@@ -445,13 +503,6 @@ def train_step(
             logger.info(f"[moe] temperature: {temperature:.4f}")
             mlflow_client.log_metric(mlflow_run_id, "moe/balance_coeff", float(balance_coeff), step=global_step + 1)
             logger.info(f"[moe] balance_coeff: {float(balance_coeff):.6f}")
-
-        # Set global step for MoE layers
-        if config.get("moe", {}).get("enabled", False):
-            unwrapped_model = accelerator.unwrap_model(model)
-            for layer in unwrapped_model.showo.model.layers:
-                if hasattr(layer, "mlp") and hasattr(layer.mlp, "set_global_step"):
-                    layer.mlp.set_global_step(global_step + 1)
 
         # Reset time meters
         batch_time_m.reset()
@@ -490,6 +541,13 @@ def train_step(
         "batch_size_mmu": batch_size_mmu,
     }
 
+def router_orth_loss(weight):
+    W = weight # [experts_coune, hidden_size]
+    W_norm = W / (W.norm(dim=1, keepdim=True) + 1e-8)
+    C = W_norm @ W_norm.t()  # shape: [experts_coune, experts_coune]
+    I = torch.eye(C.size(0), device=C.device, dtype=C.dtype)
+    loss = ((C - I)**2).sum()
+    return loss
 
 def collect_moe_balance_losses(model):
     total_balance_loss = 0.0
@@ -498,15 +556,23 @@ def collect_moe_balance_losses(model):
         unwrapped_model = model.module
     else:
         unwrapped_model = model
+        
+    gate_weights = []
 
     for layer_idx, layer in enumerate(unwrapped_model.showo.model.layers):
         if hasattr(layer, "mlp") and hasattr(layer.mlp, "gate"):
-            gate_loss, otrh_loss = layer.mlp.get_balance_loss()
+            gate_loss = layer.mlp.get_balance_loss()
             total_balance_loss += gate_loss
-            total_balance_loss += otrh_loss
+            
+            gate_weights.append(layer.mlp.gate.gate.weight)
             num_moe_layers += 1
-            logger.debug(f"MoE layer {layer_idx}: balance_loss = {gate_loss.item():.6f}, otrh_loss = {otrh_loss.item():.6f}")
-    return total_balance_loss, num_moe_layers
+            logger.debug(f"MoE layer {layer_idx}: balance_loss = {gate_loss.item():.6f}")
+            
+    gate_weights = torch.cat(gate_weights, dim=0)
+    orthogonal_loss = router_orth_loss(gate_weights)
+    print(f'{orthogonal_loss=}')
+            
+    return total_balance_loss, orthogonal_loss, num_moe_layers
 
 
 def get_vq_model_class(model_type):
@@ -751,6 +817,48 @@ def main():
     else:
         mask_schedule = get_mask_chedule(config.training.get("mask_schedule", "cosine"))
 
+    evaluation_cfg = config.get("evaluation", None)
+    metric_interval = None
+    coco_eval_dataset = None
+    coco_eval_batch_size = None
+    coco_eval_subset_seed = None
+    if evaluation_cfg:
+        metric_interval = evaluation_cfg.get("metric_interval", None)
+        coco_cfg = evaluation_cfg.get("coco", None)
+        if coco_cfg and coco_cfg.get("enabled", False):
+            images_root = coco_cfg.get("images_root")
+            ann_file = coco_cfg.get("ann_file")
+            if not images_root or not ann_file:
+                logger.warning(
+                    "COCO evaluation is enabled but images_root or ann_file is missing."
+                )
+            else:
+                subset_size = int(coco_cfg.get("subset_size", 1000))
+                subset_seed = coco_cfg.get("seed", config.training.seed)
+                try:
+                    coco_eval_dataset = COCODataset(
+                        root=images_root,
+                        annFile=ann_file,
+                    )
+                    coco_eval_dataset.restrict_to_subset(
+                        subset_size=subset_size,
+                        seed=int(subset_seed) if subset_seed is not None else 0,
+                    )
+                    coco_eval_batch_size = int(
+                        coco_cfg.get("batch_size", config.training.batch_size_t2i)
+                    )
+                    coco_eval_subset_seed = subset_seed
+                    logger.info(
+                        f"Initialized COCO evaluation subset with {len(coco_eval_dataset)} samples "
+                        f"(batch_size={coco_eval_batch_size}, seed={subset_seed})"
+                    )
+                except Exception as eval_err:
+                    logger.warning(
+                        f"Failed to initialize COCO evaluation dataset: {eval_err}"
+                    )
+                    coco_eval_dataset = None
+                    coco_eval_batch_size = None
+
     lr_scheduler = get_scheduler(
         config.lr_scheduler.scheduler,
         optimizer=optimizer,
@@ -970,18 +1078,11 @@ def main():
                         # print(f"global_step: {global_step + 1}, config.experiment.generate_every: {config.experiment.generate_every}")
                         # Debug logging for generation
                         step_plus_one = global_step + 1
-                        should_generate = (
-                            step_plus_one == 1
-                            or step_plus_one % config.experiment.generate_every == 0
-                        )
-                        if (
-                            step_plus_one % config.experiment.generate_every == 0
-                        ):
+                        should_generate = step_plus_one % config.experiment.generate_every == 0
+                        if should_generate and accelerator.is_main_process:
                             logger.info(
                                 f"🎨 Step {step_plus_one}: should_generate={should_generate}, is_main_process={accelerator.is_main_process}"
                             )
-
-                        if should_generate and accelerator.is_main_process:
                             generate_images(
                                 model,
                                 vq_model,
@@ -1021,6 +1122,38 @@ def main():
                             #         mlflow_client=mlflow_client,
                             #         mlflow_run_id=mlflow_run_id,
                             #     )
+
+                        should_eval_metrics = (
+                            accelerator.is_main_process
+                            and metric_interval
+                            and (step_plus_one % metric_interval == 0)
+                        )
+                        if should_eval_metrics:
+                            eval_model = None
+                            benchmark = None
+                            eval_model = copy.deepcopy(
+                                accelerator.unwrap_model(model)
+                            )
+                            benchmark = ShowoBenchmark(
+                                config=config,
+                                coco_dataset=coco_eval_dataset,
+                                model=eval_model,
+                                device=str(accelerator.device),
+                                save_comparisons=False,
+                            )
+                            fid_score = benchmark.run()
+                            mlflow_client.log_metric(
+                                mlflow_run_id,
+                                "metrics/fid_coco",
+                                fid_score,
+                                step=step_plus_one,
+                            )
+                            logger.info(
+                                f"✅ COCO FID (subset seed {coco_eval_subset_seed}) at step {step_plus_one}: {fid_score:.4f}"
+                            )
+                            del eval_model
+                            del benchmark
+                            torch.cuda.empty_cache()
 
                         global_step += 1
 

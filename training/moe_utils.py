@@ -28,16 +28,13 @@ class LayerExpertStatsCollector:
                     if modality not in layer_expert_counts:
                         layer_expert_counts[modality] = {}
 
-                    aggregated_counts: Dict[int, int] = {}
-                    for step_counts in history.values():
-                        if not isinstance(step_counts, dict):
-                            continue
-                        for expert_id, count in step_counts.items():
-                            aggregated_counts[expert_id] = (
-                                aggregated_counts.get(expert_id, 0) + int(count)
-                            )
-
-                    layer_expert_counts[modality][layer_idx] = aggregated_counts
+                    # Берем только данные текущего шага, а не суммируем все шаги
+                    step_counts = history.get(global_step)
+                    if step_counts is not None and isinstance(step_counts, dict):
+                        layer_expert_counts[modality][layer_idx] = step_counts.copy()
+                    else:
+                        # Если данных для текущего шага нет, используем пустой словарь
+                        layer_expert_counts[modality][layer_idx] = {}
 
         return layer_expert_counts, modality_layer_probs
 
@@ -131,6 +128,85 @@ def compute_domain_bias_tensor(
         .to(device=device, dtype=dtype)
         * hardness
     )
+
+
+def compute_domain_bias_from_sample_domains(
+    moe_layer,
+    sample_domains,
+    batch_size,
+    seq_len,
+    num_tokens,
+    dtype,
+    device,
+):
+    """
+    Вычисляет domain bias для каждого токена на основе sample_domains.
+    
+    Args:
+        moe_layer: MoE layer
+        sample_domains: [batch_size] - список доменов для каждого сэмпла (None для T2I/LM, имя домена для MMU)
+        batch_size: размер батча
+        seq_len: длина последовательности
+        num_tokens: общее количество токенов (batch_size * seq_len)
+        dtype: тип данных
+        device: устройство
+    
+    Returns:
+        domain_bias: [num_tokens, num_experts] - bias для каждого токена
+    """
+    if (
+        not getattr(moe_layer, "use_domain_bias", False)
+        or sample_domains is None
+        or len(sample_domains) == 0
+    ):
+        return None
+
+    if moe_layer._global_step < moe_layer.domain_init_steps:
+        progress = moe_layer._global_step / max(moe_layer.domain_init_steps, 1)
+        hardness = moe_layer.domain_init_hardness - (
+            moe_layer.domain_init_hardness - moe_layer.domain_init_hardness_min
+        ) * progress
+    else:
+        hardness = moe_layer.domain_init_hardness_min
+
+    if hardness <= 0:
+        return None
+
+    # Создаем bias для каждого токена на основе его домена
+    domain_bias = torch.zeros(num_tokens, moe_layer.num_experts, device=device, dtype=dtype)
+    
+    # Подсчитываем статистику по доменам для отладки
+    domain_stats = {}
+    
+    # Для каждого токена определяем его домен
+    for token_idx in range(num_tokens):
+        batch_idx = token_idx // seq_len
+        if batch_idx < len(sample_domains):
+            domain_name = sample_domains[batch_idx]
+            if domain_name is not None:
+                domain_key = str(domain_name)
+                buffer_name = moe_layer._domain_bias_buffer_map.get(domain_key)
+                if buffer_name is not None:
+                    domain_bias_vector = getattr(moe_layer, buffer_name)
+                    domain_bias[token_idx] = domain_bias_vector.to(device=device, dtype=dtype) * hardness
+                    
+                    # Отладочная статистика
+                    if moe_layer._global_step <= 2:
+                        if domain_key not in domain_stats:
+                            domain_stats[domain_key] = {
+                                'tokens': 0,
+                                'bias_vector': domain_bias_vector.cpu().clone(),
+                                'hardness': hardness
+                            }
+                        domain_stats[domain_key]['tokens'] += 1
+    
+    # Отладочный вывод
+    if moe_layer._global_step <= 2 and domain_stats:
+        print(f"[Layer {moe_layer._layer_id}] Domain bias stats (step {moe_layer._global_step}):")
+        for domain_key, stats in domain_stats.items():
+            print(f"  {domain_key}: {stats['tokens']} tokens, hardness={stats['hardness']:.2f}, bias={stats['bias_vector'].tolist()}")
+    
+    return domain_bias
 
 
 def save_moe_weights(model, path):

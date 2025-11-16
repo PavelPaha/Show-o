@@ -645,7 +645,7 @@ class MoEVisualizer:
                 for step in recent_steps:
                     probs_tensor = modality_history[step]
                     probs = (
-                        probs_tensor.detach().cpu().numpy()
+                        probs_tensor.detach().cpu().float().numpy()
                         if isinstance(probs_tensor, torch.Tensor)
                         else np.array(probs_tensor)
                     )
@@ -686,7 +686,7 @@ class MoEVisualizer:
                 ax_bar.axis("off")
                 continue
             probs = (
-                probs_tensor.detach().cpu().numpy()
+                probs_tensor.detach().cpu().float().numpy()
                 if isinstance(probs_tensor, torch.Tensor)
                 else np.array(probs_tensor)
             )
@@ -730,7 +730,7 @@ class MoEVisualizer:
         for row_idx, layer_id in enumerate(layer_ids):
             probs_tensor = layer_probability_map[layer_id]
             probs = (
-                probs_tensor.detach().cpu().numpy()
+                probs_tensor.detach().cpu().float().numpy()
                 if isinstance(probs_tensor, torch.Tensor)
                 else np.array(probs_tensor)
             )

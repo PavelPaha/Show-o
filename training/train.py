@@ -63,7 +63,7 @@ from training.utils import (
 from training.moe_visualization import MoEVisualizer
 from training.moe_mlflow_logger import MoEMLflowLogger
 from training.profiling_context import get_profiling_context_torch
-            
+
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -228,23 +228,23 @@ def train_step(
             
             image_tokens_domain = vq_model.get_code(pixel_values_domain)
             image_tokens_domain = image_tokens_domain + len(uni_prompting.text_tokenizer)
-            
+
             input_ids_domain_proc = torch.cat([
                 (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.sptids_dict['<|mmu|>']).to(accelerator.device),
                 (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.sptids_dict['<|soi|>']).to(accelerator.device),
                 image_tokens_domain,
                 (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.sptids_dict['<|eoi|>']).to(accelerator.device),
                 input_ids_domain,
-            ], dim=1).long()
-            
+        ], dim=1).long()
+
             labels_domain_proc = torch.cat([
                 (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.ignore_id).to(accelerator.device),
                 (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.ignore_id).to(accelerator.device),
                 torch.ones_like(image_tokens_domain) * uni_prompting.ignore_id,
                 (torch.ones(input_ids_domain.shape[0], 1) * uni_prompting.ignore_id).to(accelerator.device),
                 labels_domain.to(accelerator.device)
-            ], dim=1).long()
-            
+        ], dim=1).long()
+
             attention_mask_domain = create_attention_mask_for_mmu(
                 input_ids_domain_proc,
                 eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
@@ -398,14 +398,14 @@ def train_step(
         # print(f'{layer_expert_counts_by_modality=}')
         
         for modality, layer_expert_counts in layer_expert_counts_by_modality.items():
-            print(f'[layer_expert_counts_by_modality] {modality=}, {layer_expert_counts=}')
+            # print(f'[layer_expert_counts_by_modality] {modality=}, {layer_expert_counts=}')
             heatmap_bytes = visualizer.create_layer_expert_activation_heatmap(
                 layer_expert_counts, global_step=global_step + 1
             )
             mlflow_logger.log_layer_expert_heatmap(global_step + 1, heatmap_bytes, suffix=modality)
 
         for modality, layer_probabilities in probability_map.items():
-            print(f'[probability_map] {modality=}, {layer_expert_counts=}')
+            # print(f'[probability_map] {modality=}, {layer_expert_counts=}')
             prob_heatmap = visualizer.create_layer_probability_heatmap(
                 layer_probabilities, modality, global_step
             )
@@ -736,7 +736,7 @@ def main():
         cond_dropout_prob=config.training.cond_dropout_prob,
     )
 
-    print("special tokens : \n", uni_prompting.sptids_dict)
+    # print("special tokens : \n", uni_prompting.sptids_dict)
 
     # VQ model for processing image into discrete tokens
     vq_model = get_vq_model_class(config.model.vq_model.type)
@@ -796,7 +796,7 @@ def main():
         mlflow_client=mlflow_client,
         mlflow_run_id=mlflow_run_id,
         special_tokens=special_tokens
-    )
+        )
     mask_id = model.mask_token_id
 
     ##################################
@@ -1006,167 +1006,154 @@ def main():
             for batch, batch_idx, dataloader_idx in combined_dataloader:
                 data_time_m.update(time.time() - end)
 
-                try:
-                    with accelerator.accumulate(model):
-                        step_outputs = train_step(
-                            batch=batch,
-                            epoch=epoch,
-                            global_step=global_step,
+                with accelerator.accumulate(model):
+                    step_outputs = train_step(
+                        batch=batch,
+                        epoch=epoch,
+                        global_step=global_step,
+                        model=model,
+                        optimizer=optimizer,
+                        lr_scheduler=lr_scheduler,
+                        balance_scheduler=balance_scheduler,
+                        temp_scheduler=temp_scheduler,
+                        accelerator=accelerator,
+                        config=config,
+                        uni_prompting=uni_prompting,
+                        vq_model=vq_model,
+                        mask_dtype=mask_dtype,
+                        mask_id=mask_id,
+                        mask_schedule=mask_schedule,
+                        batch_time_m=batch_time_m,
+                        data_time_m=data_time_m,
+                        total_batch_size_per_gpu=total_batch_size_per_gpu,
+                        mlflow_client=mlflow_client,
+                        mlflow_run_id=mlflow_run_id,
+                        pbar=pbar,
+                    )
+
+                input_ids = step_outputs["input_ids"]
+                input_ids_t2i = step_outputs["input_ids_t2i"]
+                attention_mask = step_outputs["attention_mask"]
+                labels = step_outputs["labels"]
+                batch_size_t2i = step_outputs["batch_size_t2i"]
+                batch_size_lm = step_outputs["batch_size_lm"]
+                batch_size_mmu = step_outputs["batch_size_mmu"]
+                image_tokens_ori = step_outputs["image_tokens_ori"]
+                texts = step_outputs["texts"]
+                logits = step_outputs["logits"]
+                # avg_loss_t2i = step_outputs["avg_loss_t2i"]
+                # avg_loss_lm = step_outputs["avg_loss_lm"]
+                # avg_loss_mmu = step_outputs["avg_loss_mmu"]
+                # balance_loss = step_outputs["balance_loss"]
+                # avg_masking_rate = step_outputs["avg_masking_rate"]
+
+                # Checks if the accelerator has performed an optimization step behind the scenes
+                if accelerator.sync_gradients:
+                    batch_time_m.update(time.time() - end)
+                    end = time.time()
+                    if (
+                        (global_step + 1) % 100 == 0
+                        and config.get("moe", {}).get("enabled", False)
+                        and accelerator.is_main_process
+                    ):
+                        collect_and_log_moe_activations(
                             model=model,
-                            optimizer=optimizer,
-                            lr_scheduler=lr_scheduler,
-                            balance_scheduler=balance_scheduler,
-                            temp_scheduler=temp_scheduler,
                             accelerator=accelerator,
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels,
                             config=config,
-                            uni_prompting=uni_prompting,
-                            vq_model=vq_model,
-                            mask_dtype=mask_dtype,
-                            mask_id=mask_id,
-                            mask_schedule=mask_schedule,
-                            batch_time_m=batch_time_m,
-                            data_time_m=data_time_m,
-                            total_batch_size_per_gpu=total_batch_size_per_gpu,
+                            batch_size_t2i=batch_size_t2i,
+                            batch_size_lm=batch_size_lm,
+                            batch_size_mmu=batch_size_mmu,
+                            global_step=global_step + 1,
                             mlflow_client=mlflow_client,
                             mlflow_run_id=mlflow_run_id,
-                            pbar=pbar,
                         )
 
-                    input_ids = step_outputs["input_ids"]
-                    input_ids_t2i = step_outputs["input_ids_t2i"]
-                    attention_mask = step_outputs["attention_mask"]
-                    labels = step_outputs["labels"]
-                    batch_size_t2i = step_outputs["batch_size_t2i"]
-                    batch_size_lm = step_outputs["batch_size_lm"]
-                    batch_size_mmu = step_outputs["batch_size_mmu"]
-                    image_tokens_ori = step_outputs["image_tokens_ori"]
-                    texts = step_outputs["texts"]
-                    logits = step_outputs["logits"]
-                    # avg_loss_t2i = step_outputs["avg_loss_t2i"]
-                    # avg_loss_lm = step_outputs["avg_loss_lm"]
-                    # avg_loss_mmu = step_outputs["avg_loss_mmu"]
-                    # balance_loss = step_outputs["balance_loss"]
-                    # avg_masking_rate = step_outputs["avg_masking_rate"]
-
-                    # Checks if the accelerator has performed an optimization step behind the scenes
-                    if accelerator.sync_gradients:
-                        batch_time_m.update(time.time() - end)
-                        end = time.time()
-                        if (
-                            (global_step + 1) % 100 == 0
-                            and config.get("moe", {}).get("enabled", False)
-                            and accelerator.is_main_process
-                        ):
-                            collect_and_log_moe_activations(
-                                model=model,
-                                accelerator=accelerator,
-                                input_ids=input_ids,
-                                attention_mask=attention_mask,
-                                labels=labels,
-                                config=config,
-                                batch_size_t2i=batch_size_t2i,
-                                batch_size_lm=batch_size_lm,
-                                batch_size_mmu=batch_size_mmu,
-                                global_step=global_step + 1,
-                                mlflow_client=mlflow_client,
-                                mlflow_run_id=mlflow_run_id,
-                            )
-
-                        # if (global_step + 1) % config.experiment.save_every == 0:
-                        #     save_checkpoint(model, config, accelerator, global_step + 1)
-
-                        # print(f"global_step: {global_step + 1}, config.experiment.generate_every: {config.experiment.generate_every}")
-                        # Debug logging for generation
-                        step_plus_one = global_step + 1
-                        should_generate = step_plus_one % config.experiment.generate_every == 0
-                        if should_generate and accelerator.is_main_process:
-                            logger.info(
-                                f"🎨 Step {step_plus_one}: should_generate={should_generate}, is_main_process={accelerator.is_main_process}"
-                            )
-                            generate_images(
-                                model,
-                                vq_model,
-                                uni_prompting,
-                                accelerator,
-                                config,
-                                global_step + 1,
-                                mask_schedule=mask_schedule,
-                                mlflow_client=mlflow_client,
-                                mlflow_run_id=mlflow_run_id,
-                            )
-
-                            visualize_predictions(
-                                model,
-                                vq_model,
-                                uni_prompting,
-                                config,
-                                global_step + 1,
-                                input_ids_t2i,
-                                image_tokens_ori,
-                                batch["t2i_flow"]["images"],
-                                texts,
-                                logits,
-                                mlflow_client=mlflow_client,
-                                mlflow_run_id=mlflow_run_id,
-                            )
-
-                            # if not config.model.showo.get("w_clip_vit", False):
-                            #     evaluate_mmu(
-                            #         model,
-                            #         vq_model,
-                            #         uni_prompting,
-                            #         accelerator,
-                            #         config,
-                            #         global_step + 1,
-                            #         batch["mmu_flow"],
-                            #         mlflow_client=mlflow_client,
-                            #         mlflow_run_id=mlflow_run_id,
-                            #     )
-
-                        should_eval_metrics = (
-                            accelerator.is_main_process
-                            and metric_interval
-                            and (step_plus_one % metric_interval == 0)
+                    step_plus_one = global_step + 1
+                    should_generate = step_plus_one % config.experiment.generate_every == 0
+                    if should_generate and accelerator.is_main_process:
+                        logger.info(
+                            f"🎨 Step {step_plus_one}: should_generate={should_generate}, is_main_process={accelerator.is_main_process}"
                         )
-                        if should_eval_metrics:
-                            eval_model = None
-                            benchmark = None
-                            eval_model = copy.deepcopy(
-                                accelerator.unwrap_model(model)
-                            )
-                            benchmark = ShowoBenchmark(
-                                config=config,
-                                coco_dataset=coco_eval_dataset,
-                                model=eval_model,
-                                device=str(accelerator.device),
-                                save_comparisons=False,
-                            )
-                            fid_score = benchmark.run()
-                            mlflow_client.log_metric(
-                                mlflow_run_id,
-                                "metrics/fid_coco",
-                                fid_score,
-                                step=step_plus_one,
-                            )
-                            logger.info(
-                                f"✅ COCO FID (subset seed {coco_eval_subset_seed}) at step {step_plus_one}: {fid_score:.4f}"
-                            )
-                            del eval_model
-                            del benchmark
-                            torch.cuda.empty_cache()
+                        generate_images(
+                            model,
+                            vq_model,
+                            uni_prompting,
+                            accelerator,
+                            config,
+                            global_step + 1,
+                            mask_schedule=mask_schedule,
+                            mlflow_client=mlflow_client,
+                            mlflow_run_id=mlflow_run_id,
+                        )
 
-                        global_step += 1
+                        visualize_predictions(
+                            model,
+                            vq_model,
+                            uni_prompting,
+                            config,
+                            global_step + 1,
+                            input_ids_t2i,
+                            image_tokens_ori,
+                            batch["t2i_flow"]["images"],
+                            texts,
+                            logits,
+                            mlflow_client=mlflow_client,
+                            mlflow_run_id=mlflow_run_id,
+                        )
 
-                        if global_step >= config.training.max_train_steps:
-                            logger.info(f"Достигнут лимит шагов: {global_step} >= {config.training.max_train_steps}")
-                            break
-                except Exception as e:
-                    logger.error(f"Ошибка на шаге {global_step}: {e}", exc_info=True)
-                    # Продолжаем обучение даже при ошибке
+                        # if not config.model.showo.get("w_clip_vit", False):
+                        #     evaluate_mmu(
+                        #         model,
+                        #         vq_model,
+                        #         uni_prompting,
+                        #         accelerator,
+                        #         config,
+                        #         global_step + 1,
+                        #         batch["mmu_flow"],
+                        #         mlflow_client=mlflow_client,
+                        #         mlflow_run_id=mlflow_run_id,
+                        #     )
+
+                    should_eval_metrics = (
+                        accelerator.is_main_process
+                        and metric_interval
+                        and (step_plus_one % metric_interval == 0)
+                    )
+                    if should_eval_metrics:
+                        eval_model = None
+                        benchmark = None
+                        eval_model = copy.deepcopy(
+                            accelerator.unwrap_model(model)
+                        )
+                        benchmark = ShowoBenchmark(
+                            config=config,
+                            coco_dataset=coco_eval_dataset,
+                            model=eval_model,
+                            device=str(accelerator.device),
+                            save_comparisons=False,
+                        )
+                        fid_score = benchmark.run()
+                        mlflow_client.log_metric(
+                            mlflow_run_id,
+                            "metrics/fid_coco",
+                            fid_score,
+                            step=step_plus_one,
+                        )
+                        logger.info(
+                            f"✅ COCO FID (subset seed {coco_eval_subset_seed}) at step {step_plus_one}: {fid_score:.4f}"
+                        )
+                        del eval_model
+                        del benchmark
+                        torch.cuda.empty_cache()
+
                     global_step += 1
+
                     if global_step >= config.training.max_train_steps:
+                        logger.info(f"Достигнут лимит шагов: {global_step} >= {config.training.max_train_steps}")
                         break
-                    continue
         except Exception as e:
             logger.error(f"Критическая ошибка в цикле обучения: {e}", exc_info=True)
             # Не останавливаем обучение, просто логируем ошибку

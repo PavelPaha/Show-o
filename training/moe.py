@@ -11,6 +11,7 @@ from training.moe_visualization import MoEVisualizer
 from training.moe_utils import (
     compute_modality_bias_tensor,
     compute_domain_bias_tensor,
+    compute_domain_bias_from_sample_domains,
 )
 
 from collections import defaultdict
@@ -82,17 +83,13 @@ class MoE(nn.Module):
         )
         self.hidden_size = hidden_size
         num_text_experts = self.num_experts // 2
-        tot_expert = self.num_experts * 4  # world_size=4
-        self.register_buffer('modality_bias_text', torch.zeros(tot_expert))
-        self.register_buffer('modality_bias_image', torch.zeros(tot_expert))
+        # Use local experts only - bias size is num_experts (not tot_expert)
+        self.register_buffer('modality_bias_text', torch.zeros(self.num_experts))
+        self.register_buffer('modality_bias_image', torch.zeros(self.num_experts))
         init_bias_val = 0.0
-        for rank in range(4):  # world_size=4
-            start_text = rank * self.num_experts
-            end_text = start_text + num_text_experts
-            start_image = end_text
-            end_image = start_image + num_text_experts
-            self.modality_bias_text[start_text:end_text] = init_bias_val
-            self.modality_bias_image[start_image:end_image] = init_bias_val
+        # Set bias for local experts: first half for text, second half for image
+        self.modality_bias_text[:num_text_experts] = init_bias_val
+        self.modality_bias_image[num_text_experts:] = init_bias_val
         self.use_modality_bias = bool(use_modality_bias)
         self.use_domain_bias = bool(use_domain_bias)
         self.modality_init_hardness = float(modality_init_hardness)
@@ -107,12 +104,11 @@ class MoE(nn.Module):
         for idx, (domain_name, expert_list) in enumerate(self.domain_to_expert_map.items()):
             if not expert_list:
                 continue
-            bias_vec = torch.zeros(tot_expert, dtype=torch.float32)
-            for rank in range(self.world_size):
-                base = rank * num_experts
-                for expert_id in expert_list:
-                    if 0 <= expert_id < num_experts:
-                        bias_vec[base + expert_id] = 1.0
+            # Use local experts only - bias size is num_experts
+            bias_vec = torch.zeros(self.num_experts, dtype=torch.float32)
+            for expert_id in expert_list:
+                if 0 <= expert_id < self.num_experts:
+                    bias_vec[expert_id] = 1.0
             buffer_name = f"_domain_bias_vec_{idx}"
             self.register_buffer(buffer_name, bias_vec)
             self._domain_bias_buffer_map[str(domain_name)] = buffer_name
@@ -196,9 +192,12 @@ class MoE(nn.Module):
         if modality_bias is not None:
             total_bias = modality_bias
 
-        domain_bias_tensor = compute_domain_bias_tensor(
+        # Используем sample_domains для правильного применения domain bias к каждому токену
+        domain_bias_tensor = compute_domain_bias_from_sample_domains(
             self,
-            domain_id,
+            sample_domains,
+            batch_size,
+            seq_len,
             B,
             hidden_states.dtype,
             device,
@@ -214,16 +213,13 @@ class MoE(nn.Module):
                 total_bias = total_bias + bias
 
         gate_idx, gate_score = self.gate(hidden_states_flat, temperature=temperature, bias=total_bias)
+        # gate_idx now contains local expert indices (0 to num_experts-1) directly
         overflowed_mask = (gate_idx[:, 0] == -1) & (gate_idx[:, 1] == -1)
-        
-        # Convert global expert indices to local indices (0 to num_experts-1)
-        # GShardGate returns global indices (0 to tot_expert-1), but we need local (0 to num_experts-1)
-        gate_idx_local = gate_idx % self.num_experts
         
         out_flat = torch.zeros(B, hidden_size, device=device, dtype=hidden_states.dtype)
         
         for k in range(self.top_k):
-            expert_indices = gate_idx_local[:, k]  # Use local indices
+            expert_indices = gate_idx[:, k]  # Local indices (0 to num_experts-1)
             weights = gate_score[:, k]
             for expert_id in range(self.num_experts):
                 mask = (expert_indices == expert_id) & (~overflowed_mask)
@@ -246,9 +242,9 @@ class MoE(nn.Module):
             and self._global_step % self._log_frequency == 0
         )
         if should_log:
-            # Use local indices for logging as well
+            # gate_idx already contains local indices (0 to num_experts-1)
             self._log_gate_distribution(
-                gate_idx_local, gate_score.detach(), input_ids, 
+                gate_idx, gate_score.detach(), input_ids, 
                 batch_size=batch_size, seq_len=seq_len,
                 domain_id=domain_id, sample_domains=sample_domains
             )
@@ -283,11 +279,11 @@ class MoE(nn.Module):
         total_activations = sum(expert_counts.values())
         domain_key = str(domain_id)
         
-        if self._global_step <= 2:
-            print(f"[Layer {self._layer_id}] _log_gate_distribution: domain_id={domain_id}, sample_domains={sample_domains}")
-            if token_domains_flat:
-                unique_domains = set(d for d in token_domains_flat if d is not None)
-                print(f"[Layer {self._layer_id}] Unique token domains: {unique_domains}")
+        # if self._global_step <= 2:
+        #     # print(f"[Layer {self._layer_id}] _log_gate_distribution: domain_id={domain_id}, sample_domains={sample_domains}")
+        #     if token_domains_flat:
+        #         unique_domains = set(d for d in token_domains_flat if d is not None)
+        #         print(f"[Layer {self._layer_id}] Unique token domains: {unique_domains}")
 
         accumulate_overall = self._log_overall_enabled
         emit_overall = (
@@ -300,11 +296,11 @@ class MoE(nn.Module):
             and self._domain_last_logged_step.get(domain_key) != self._global_step
         )
         
-        print(f"[Layer {self._layer_id}] accumulate_overall={accumulate_overall}, emit_overall={emit_overall}, log_domain={log_domain}")
+        # print(f"[Layer {self._layer_id}] accumulate_overall={accumulate_overall}, emit_overall={emit_overall}, log_domain={log_domain}")
 
-        if not accumulate_overall and not log_domain:
-            print(f"[Layer {self._layer_id}] Skipping logging (no accumulate/log flags)")
-            return
+        # if not accumulate_overall and not log_domain:
+        #     print(f"[Layer {self._layer_id}] Skipping logging (no accumulate/log flags)")
+        #     return
         
         text_expert_counts = None
         image_expert_counts = None
@@ -380,8 +376,8 @@ class MoE(nn.Module):
         # ВАЖНО: делаем это ДО вызова _log_all_plots_to_mlflow, чтобы домены были в history
         if token_domains_flat is not None and len(token_domains_flat) > 0:
             unique_domains = set(d for d in token_domains_flat if d is not None)
-            if self._global_step <= 2:
-                print(f"[Layer {self._layer_id}] Found unique domains in sample_domains: {unique_domains}")
+            # if self._global_step <= 2:
+            #     print(f"[Layer {self._layer_id}] Found unique domains in sample_domains: {unique_domains}")
             
             for domain_name in unique_domains:
                 # Создаем маску для токенов этого домена
@@ -409,7 +405,13 @@ class MoE(nn.Module):
                 
                 if should_log_this_domain:
                     if self._global_step <= 2:
-                        print(f"[Layer {self._layer_id}] Logging domain: {domain_key_str}, counts={domain_expert_counts}")
+                        num_tokens_in_domain = domain_mask.sum().item()
+                        # print(f"[Layer {self._layer_id}] Logging domain: {domain_key_str}, tokens={num_tokens_in_domain}, counts={domain_expert_counts}")
+                        # Проверяем, что все токены действительно из этого домена
+                        domain_tokens_check = [token_domains_flat[i] for i in range(len(token_domains_flat)) if domain_mask[i]]
+                        unique_in_domain = set(domain_tokens_check)
+                        # if len(unique_in_domain) > 1:
+                        #     print(f"[Layer {self._layer_id}] WARNING: Domain {domain_key_str} has mixed domains: {unique_in_domain}")
                     self._ensure_domain_buffer(domain_key_str)
                     self._accumulate_history(
                         self._gate_distribution_history[domain_key_str], domain_expert_counts
@@ -433,30 +435,9 @@ class MoE(nn.Module):
                 overall_gate_score=gate_score,
                 text_expert_counts=text_expert_counts,
                 image_expert_counts=image_expert_counts,
-                domain_id=domain_key,
+                domain_id=None,  # Не используем domain_id для legacy логирования
             )
             self._last_overall_logged_step = self._global_step
-        
-        # Legacy: also process domain_id if provided (for backward compatibility)
-        if log_domain and domain_key is not None:
-            print(f"[Layer {self._layer_id}] Logging domain from domain_id: {domain_key}")
-            self._ensure_domain_buffer(domain_key)
-            domain_expert_counts = expert_counts.copy()
-            self._accumulate_history(
-                self._gate_distribution_history[domain_key], domain_expert_counts
-            )
-            print(f"[Layer {self._layer_id}] Domain {domain_key} history after accumulate: {self._gate_distribution_history[domain_key]}")
-            domain_probs, domain_weight = self._compute_average_gate_probs(gate_idx, gate_score)
-            self._store_probability(
-                history_dict=self._gate_probability_history[domain_key],
-                history_key=f"domain_{domain_key}",
-                probs=domain_probs,
-                weight=domain_weight,
-                finalize=True,
-            )
-            self._save_distribution_to_json(domain_expert_counts, f"domain_{domain_key}")
-            self._domain_last_logged_step[domain_key] = self._global_step
-            print(f"[Layer {self._layer_id}] Domain {domain_key} logged, _domain_last_logged_step={self._domain_last_logged_step}")
     
     
     def _log_all_plots_to_mlflow(self, overall_expert_counts, 
@@ -489,7 +470,7 @@ class MoE(nn.Module):
                 domain_id, domain_history, self._global_step, current_expert_counts
             )
         
-        print(f"[Layer {self._layer_id}] Creating all_domains plot, history keys: {list(self._gate_distribution_history.keys())}")
+        # print(f"[Layer {self._layer_id}] Creating all_domains plot, history keys: {list(self._gate_distribution_history.keys())}")
         all_domains_plot_bytes = self._visualizer.create_all_domains_combined_plot(
             self._gate_distribution_history, self._global_step
         )
@@ -549,8 +530,8 @@ class MoE(nn.Module):
 
         probs = torch.zeros(self.num_experts, device=gate_idx.device, dtype=gate_score.dtype)
         for k in range(self.top_k):
-            expert_ids = gate_idx[:, k]
-            weights = normalized_scores[:, k]
+            expert_ids = gate_idx[:, k].long()  # Ensure long dtype for indexing
+            weights = normalized_scores[:, k].to(dtype=probs.dtype)  # Ensure same dtype as probs
             valid_k = token_has_valid & expert_valid[:, k]
             if valid_k.any():
                 probs.scatter_add_(0, expert_ids[valid_k], weights[valid_k])
@@ -616,8 +597,9 @@ class MoE(nn.Module):
         buffer_name = self._domain_bias_buffer_map.get(domain_key)
         if buffer_name is None:
             buffer_name = f"_domain_bias_vec_extra_{len(self._domain_bias_buffer_map)}"
+            # Use local experts only - bias size is num_experts
             bias_vec = torch.zeros(
-                self.num_experts * self.world_size,
+                self.num_experts,
                 dtype=torch.float32,
                 device=self.modality_bias_text.device,
             )

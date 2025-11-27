@@ -1,0 +1,99 @@
+mlflow:
+    enabled: false
+    tracking_uri: "file:./mlruns"
+    experiment_name: "benchmark"
+    tags:
+        model: "show-o"
+        task: "benchmark"
+
+mode: "t2i"
+
+experiment:
+    project: "benchmark"
+    name: "showo-benchmark"
+    output_dir: "output/showo-benchmark"
+
+evaluation:
+    metric_interval: 500
+    coco:
+        enabled: true
+        images_root: "/home/jovyan/vasiliev/notebooks/Show-o/train2017"
+        ann_file: "/home/jovyan/vasiliev/notebooks/Show-o/annotations/captions_train2017.json"
+        subset_size: 50  # Уменьшено с 100 до 50 для ускорения
+        batch_size: 8  # Увеличено с 4 до 8 для параллелизации
+        seed: 42
+    mmu:
+        enabled: true
+        dataset_type: "mmmu"
+        subset_size: 100
+        batch_size: 4
+        seed: 42
+
+moe:
+    enabled: false
+
+model:
+    vq_model:
+        type: "magvitv2"
+        vq_model_name: "showlab/magvitv2"
+
+    showo:
+        load_from_showo: True
+        pretrained_model_path: "showlab/show-o-w-clip-vit"
+        w_clip_vit: True
+        vocab_size: 58498
+        llm_vocab_size: 50295
+        llm_model_path: "microsoft/phi-1_5"
+        codebook_size: 8192
+        num_vq_tokens: 256
+        num_new_special_tokens: 10
+
+    gradient_checkpointing: False
+
+dataset:
+    gen_type: "imagenet1k"
+    und_type: "llava_pretrain"
+    combined_loader_mode: "max_size_cycle"
+    add_system_prompt: False
+
+    use_vqav2: false
+    use_textvqa: false
+    use_textvqa_experiments: false  
+    use_vqav2_experiments: false
+    use_clevr: false
+    use_docvqa: false
+    use_kvasir: false
+    
+    params:
+        train_t2i_shards_path_or_url: "/home/jovyan/vasiliev/notebooks/Show-o/data/llava_pretrain/images"
+        train_lm_shards_path_or_url: "/home/jovyan/vasiliev/notebooks/Show-o/data/llava_pretrain"
+        validation_prompts_file: "validation_prompts/text2image_prompts.txt"
+        num_workers: 4
+        shuffle_buffer_size: 1000
+        pin_memory: True
+        persistent_workers: False
+        
+    preprocessing:
+        max_seq_length: 256
+        resolution: 256
+
+training:
+    gradient_accumulation_steps: 1
+    noise_type: "mask"
+
+    batch_size: 2
+    batch_size_t2i: 2
+    batch_size_lm: 1
+    batch_size_mmu: 1
+
+    mixed_precision: "bf16"
+    enable_tf32: True
+    seed: 42
+    cond_dropout_prob: 0.1
+    guidance_scale: 3.0
+    generation_timesteps: 18  # Уменьшено с 18 до 12 для ускорения (~33% быстрее)
+    
+    mmu_max_new_tokens: 128
+    mmu_temperature: 0.7
+    mmu_top_k: null
+

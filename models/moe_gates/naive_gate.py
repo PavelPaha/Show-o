@@ -23,7 +23,8 @@ class NaiveGate(BaseGate):
 
     def __init__(self, d_model, num_expert, world_size, top_k=2, gate_bias=True):
         super().__init__(num_expert, world_size)
-        self.gate = nn.Linear(d_model, self.tot_expert, bias=gate_bias)
+        # Use local experts only - each GPU has its own set of experts (0 to num_expert-1)
+        self.gate = nn.Linear(d_model, self.num_expert, bias=gate_bias)
         self.top_k = top_k
 
     def forward(self, inp, return_all_scores=False, bias: Optional[torch.Tensor] = None):

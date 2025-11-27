@@ -531,7 +531,7 @@ class MoEVisualizer:
 
             domain_history = domain_distribution_history.get(domain_id, {})
             steps = sorted(domain_history.keys())
-            recent_steps = steps[-min(10, len(steps)) :]
+            recent_steps = steps
 
             heatmap_data = np.zeros((self.num_experts, len(recent_steps)))
 
@@ -559,15 +559,19 @@ class MoEVisualizer:
             ax_heatmap.set_title(
                 f"{domain_id} - Heatmap", fontsize=11, fontweight="bold"
             )
-            ax_heatmap.set_xlabel("Step (recent)", fontsize=9)
+            ax_heatmap.set_xlabel("Step", fontsize=9)
             ax_heatmap.set_ylabel("Expert ID", fontsize=9)
             ax_heatmap.set_yticks(range(self.num_experts))
             ax_heatmap.set_yticklabels(range(self.num_experts))
-            if len(recent_steps) <= 10:
-                ax_heatmap.set_xticks(range(len(recent_steps)))
-                ax_heatmap.set_xticklabels(
-                    [str(s) for s in recent_steps], rotation=45
-                )
+            
+            # Отображаем подписи шагов с интервалом, чтобы не перекрывались
+            if len(recent_steps) > 0:
+                # Показываем подписи с интервалом, чтобы было не более 20 меток
+                step_interval = max(1, len(recent_steps) // 20)
+                tick_indices = range(0, len(recent_steps), step_interval)
+                tick_labels = [str(recent_steps[i]) for i in tick_indices]
+                ax_heatmap.set_xticks(tick_indices)
+                ax_heatmap.set_xticklabels(tick_labels, rotation=45, ha='right')
             plt.colorbar(
                 im, ax=ax_heatmap, label="Normalized Gate Distribution"
             )

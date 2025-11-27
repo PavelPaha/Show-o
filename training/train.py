@@ -7,6 +7,7 @@ sys.path.insert(0, "/home/jovyan/vasiliev/notebooks/Show-o")
 
 import logging
 import time
+import math
 from pathlib import Path
 from typing import Union
 from utils import get_optimizer
@@ -52,7 +53,7 @@ from training.eval_utils import (
     evaluate_mmu,
 )
 from benchmark.coco_dataset import COCODataset
-from benchmark.benchmark import ShowoBenchmark
+from benchmark.fid_benchmark import ShowoBenchmark
 from training.dataset_utils import create_dataloaders
 from training.checkpoint_utils import save_checkpoint
 from training.utils import (
@@ -263,25 +264,43 @@ def train_step(
         domain_id = present_domain_flows[0][:-5]  # use first domain as primary
         domain_ids = [flow[:-5] for flow in present_domain_flows]
     elif "llava" in config.dataset.und_type:
-        # Fallback to mmu_flow
-        pixel_values_mmu, texts_mmu = (
-            batch["mmu_flow"]["images"],
-            batch["mmu_flow"]["input_ids"],
-        )
+        # Fallback to mmu_flow - data is already tokenized
+        pixel_values_mmu = batch["mmu_flow"]["images"]
+        input_ids_mmu = batch["mmu_flow"]["input_ids"]
+        labels_mmu = batch["mmu_flow"]["labels"]
+        
         pixel_values_mmu = pixel_values_mmu.to(accelerator.device, non_blocking=True)
-        image_tokens_mmu = vq_model.get_code(pixel_values_mmu)
-        image_tokens_mmu = image_tokens_mmu + len(uni_prompting.text_tokenizer)
-        input_ids_mmu, _, labels_mmu = uni_prompting(
-            (image_tokens_mmu, texts_mmu), "mmu"
-        )
         input_ids_mmu = input_ids_mmu.to(accelerator.device, non_blocking=True)
         labels_mmu = labels_mmu.to(accelerator.device)
+        
+        # Get image tokens from VQ model
+        image_tokens_mmu = vq_model.get_code(pixel_values_mmu)
+        image_tokens_mmu = image_tokens_mmu + len(uni_prompting.text_tokenizer)
+        
+        # Create input sequence: <|mmu|> <|soi|> image_tokens <|eoi|> text_tokens
+        input_ids_mmu = torch.cat([
+            (torch.ones(input_ids_mmu.shape[0], 1) * uni_prompting.sptids_dict['<|mmu|>']).to(accelerator.device),
+            (torch.ones(input_ids_mmu.shape[0], 1) * uni_prompting.sptids_dict['<|soi|>']).to(accelerator.device),
+            image_tokens_mmu,
+            (torch.ones(input_ids_mmu.shape[0], 1) * uni_prompting.sptids_dict['<|eoi|>']).to(accelerator.device),
+            input_ids_mmu,
+        ], dim=1).long()
+        
+        # Create labels: ignore special tokens and image tokens
+        labels_mmu = torch.cat([
+            (torch.ones(input_ids_mmu.shape[0], 1) * uni_prompting.ignore_id).to(accelerator.device),  # <|mmu|>
+            (torch.ones(input_ids_mmu.shape[0], 1) * uni_prompting.ignore_id).to(accelerator.device),  # <|soi|>
+            torch.ones_like(image_tokens_mmu) * uni_prompting.ignore_id,  # image tokens
+            (torch.ones(input_ids_mmu.shape[0], 1) * uni_prompting.ignore_id).to(accelerator.device),  # <|eoi|>
+            labels_mmu.to(accelerator.device)  # text labels
+        ], dim=1).long()
+        
         attention_mask_mmu = create_attention_mask_for_mmu(
             input_ids_mmu,
             eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
         ).to(mask_dtype)
         mmu_domain_assignments = [None] * input_ids_mmu.shape[0]
-        batch_size_mmu = input_ids_mmu.shape[0]
+        batch_size_mmu = pixel_values_mmu.shape[0]
     else:
         # No MMU data
         input_ids_mmu = torch.empty((0, input_ids.shape[1]), dtype=input_ids.dtype, device=input_ids.device)
@@ -343,7 +362,7 @@ def train_step(
         logger.info(f"   Expected image token range: [{len(uni_prompting.text_tokenizer)}, {len(uni_prompting.text_tokenizer) + 8192 - 1}]")
 
     current_temperature = temp_scheduler.get_last_lr()[0]
-    should_log_layer_expert = global_step % config.experiment["generate_every"] == 0
+    should_log_layer_expert = global_step % config.experiment.log_every == 0
     if config.get("moe", {}).get("enabled", False):
         set_moe_layers_global_step(model, accelerator, global_step)
 
@@ -412,6 +431,10 @@ def train_step(
             mlflow_logger.log_layer_probability_heatmap(
                 global_step + 1, prob_heatmap, suffix=modality
             )
+    
+    # Синхронизируем все процессы после логирования MoE статистики (может занимать много времени)
+    if should_log_layer_expert:
+        accelerator.wait_for_everyone()
 
     loss = (
         config.training.t2i_coeff * loss_t2i
@@ -501,8 +524,18 @@ def train_step(
             temperature = float(temp_scheduler.get_last_lr()[0])
             mlflow_client.log_metric(mlflow_run_id, "moe/temperature", temperature, step=global_step + 1)
             logger.info(f"[moe] temperature: {temperature:.4f}")
+            
             mlflow_client.log_metric(mlflow_run_id, "moe/balance_coeff", float(balance_coeff), step=global_step + 1)
             logger.info(f"[moe] balance_coeff: {float(balance_coeff):.6f}")
+            
+            unwrapped_model = accelerator.unwrap_model(model)
+            domain_bias_hardness = 0.0
+            for layer in unwrapped_model.showo.model.layers:
+                if hasattr(layer, "mlp") and hasattr(layer.mlp, "get_domain_bias_hardness"):
+                    domain_bias_hardness = layer.mlp.get_domain_bias_hardness()
+                    break
+            mlflow_client.log_metric(mlflow_run_id, "moe/domain_bias_hardness", domain_bias_hardness, step=global_step + 1)
+            logger.info(f"[moe] domain_bias_hardness: {domain_bias_hardness:.4f}")
 
         # Reset time meters
         batch_time_m.reset()
@@ -818,46 +851,31 @@ def main():
         mask_schedule = get_mask_chedule(config.training.get("mask_schedule", "cosine"))
 
     evaluation_cfg = config.get("evaluation", None)
-    metric_interval = None
-    coco_eval_dataset = None
-    coco_eval_batch_size = None
-    coco_eval_subset_seed = None
-    if evaluation_cfg:
-        metric_interval = evaluation_cfg.get("metric_interval", None)
-        coco_cfg = evaluation_cfg.get("coco", None)
-        if coco_cfg and coco_cfg.get("enabled", False):
-            images_root = coco_cfg.get("images_root")
-            ann_file = coco_cfg.get("ann_file")
-            if not images_root or not ann_file:
-                logger.warning(
-                    "COCO evaluation is enabled but images_root or ann_file is missing."
-                )
-            else:
-                subset_size = int(coco_cfg.get("subset_size", 1000))
-                subset_seed = coco_cfg.get("seed", config.training.seed)
-                try:
-                    coco_eval_dataset = COCODataset(
-                        root=images_root,
-                        annFile=ann_file,
-                    )
-                    coco_eval_dataset.restrict_to_subset(
-                        subset_size=subset_size,
-                        seed=int(subset_seed) if subset_seed is not None else 0,
-                    )
-                    coco_eval_batch_size = int(
-                        coco_cfg.get("batch_size", config.training.batch_size_t2i)
-                    )
-                    coco_eval_subset_seed = subset_seed
-                    logger.info(
-                        f"Initialized COCO evaluation subset with {len(coco_eval_dataset)} samples "
-                        f"(batch_size={coco_eval_batch_size}, seed={subset_seed})"
-                    )
-                except Exception as eval_err:
-                    logger.warning(
-                        f"Failed to initialize COCO evaluation dataset: {eval_err}"
-                    )
-                    coco_eval_dataset = None
-                    coco_eval_batch_size = None
+    coco_cfg = evaluation_cfg.get("coco", None)
+    coco_eval_batch_size = int(
+        coco_cfg.get("batch_size", config.training.batch_size_t2i)
+    )
+    metric_interval = evaluation_cfg.get("metric_interval", None)
+    
+    images_root = coco_cfg.get("images_root")
+    ann_file = coco_cfg.get("ann_file")
+    
+    subset_size = coco_cfg.subset_size
+    subset_seed = config.training.seed
+    coco_eval_dataset = COCODataset(
+        root=images_root,
+        annFile=ann_file,
+    )
+    periodic_fid_seed = int(subset_seed) + 9999 if subset_seed is not None else 9999
+    coco_eval_dataset.restrict_to_subset(
+        subset_size=subset_size,
+        seed=periodic_fid_seed,
+    )
+    logger.info(
+        f"Initialized COCO periodic FID dataset with {len(coco_eval_dataset)} samples "
+        f"(batch_size={coco_eval_dataset}, seed={periodic_fid_seed})"
+    )
+
 
     lr_scheduler = get_scheduler(
         config.lr_scheduler.scheduler,
@@ -898,11 +916,15 @@ def main():
         temp_steps = int(config.moe["temp_steps"]) if "temp_steps" in config.moe else int(config.training.max_train_steps)
         _temp_dummy_param = nn.Parameter(torch.zeros((), device=accelerator.device))
         temp_optimizer = torch.optim.SGD([{"params": [_temp_dummy_param], "lr": temp_start}])
-        def _linear_factor(step: int):
+        def _cosine_factor(step: int):
             s = min(int(step), int(max(temp_steps, 1)))
-            a = s / max(temp_steps, 1)
-            return (1.0 - a) + a * (temp_end / max(temp_start, 1e-8))
-        temp_scheduler = LambdaLR(temp_optimizer, lr_lambda=_linear_factor)
+            progress = s / max(temp_steps, 1)
+            # Косинусное расписание: temp = temp_end + (temp_start - temp_end) * (1 + cos(π * progress)) / 2
+            cosine_factor = (1 + math.cos(math.pi * progress)) / 2
+            temp_current = temp_end + (temp_start - temp_end) * cosine_factor
+            return temp_current / max(temp_start, 1e-8)
+
+        temp_scheduler = LambdaLR(temp_optimizer, lr_lambda=_cosine_factor)
 
     ##################################
     #         DATALOADER             #
@@ -1054,22 +1076,24 @@ def main():
                     if (
                         (global_step + 1) % 100 == 0
                         and config.get("moe", {}).get("enabled", False)
-                        and accelerator.is_main_process
                     ):
-                        collect_and_log_moe_activations(
-                            model=model,
-                            accelerator=accelerator,
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            labels=labels,
-                            config=config,
-                            batch_size_t2i=batch_size_t2i,
-                            batch_size_lm=batch_size_lm,
-                            batch_size_mmu=batch_size_mmu,
-                            global_step=global_step + 1,
-                            mlflow_client=mlflow_client,
-                            mlflow_run_id=mlflow_run_id,
-                        )
+                        if accelerator.is_main_process:
+                            collect_and_log_moe_activations(
+                                model=model,
+                                accelerator=accelerator,
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                labels=labels,
+                                config=config,
+                                batch_size_t2i=batch_size_t2i,
+                                batch_size_lm=batch_size_lm,
+                                batch_size_mmu=batch_size_mmu,
+                                global_step=global_step + 1,
+                                mlflow_client=mlflow_client,
+                                mlflow_run_id=mlflow_run_id,
+                            )
+                        # Синхронизируем все процессы после сбора статистики
+                        accelerator.wait_for_everyone()
 
                     step_plus_one = global_step + 1
                     should_generate = step_plus_one % config.experiment.generate_every == 0
@@ -1117,37 +1141,69 @@ def main():
                         #         mlflow_run_id=mlflow_run_id,
                         #     )
 
-                    should_eval_metrics = (
-                        accelerator.is_main_process
-                        and metric_interval
-                        and (step_plus_one % metric_interval == 0)
-                    )
+                    should_eval_metrics = (step_plus_one == 1 or step_plus_one % metric_interval == 0)
+                    
                     if should_eval_metrics:
-                        eval_model = None
-                        benchmark = None
-                        eval_model = copy.deepcopy(
-                            accelerator.unwrap_model(model)
-                        )
+                        if accelerator.is_main_process:
+                            print('Run distributed benchmark')
+                        
+                        device = str(accelerator.device)
+                        rank = accelerator.process_index
+                        world_size = accelerator.num_processes
+                    
+                        unwrapped_model = accelerator.unwrap_model(model).to(device)
+                        mask_token_id = unwrapped_model.config.mask_token_id
+                        
+
                         benchmark = ShowoBenchmark(
                             config=config,
                             coco_dataset=coco_eval_dataset,
-                            model=eval_model,
-                            device=str(accelerator.device),
+                            model=unwrapped_model,
+                            vq_model=vq_model,
+                            mask_token_id=mask_token_id,
+                            device=device,
                             save_comparisons=False,
                         )
-                        fid_score = benchmark.run()
-                        mlflow_client.log_metric(
-                            mlflow_run_id,
-                            "metrics/fid_coco",
-                            fid_score,
-                            step=step_plus_one,
-                        )
-                        logger.info(
-                            f"✅ COCO FID (subset seed {coco_eval_subset_seed}) at step {step_plus_one}: {fid_score:.4f}"
-                        )
-                        del eval_model
+                        
+                        subset_size = config.evaluation.coco.get('subset_size', 100)
+                        seed = config.evaluation.coco.get('seed', 42)
+                        
+                        # Создаем индексы и делим их между процессами
+                        import random
+                        rng = random.Random(seed)
+                        all_indices = list(range(len(coco_eval_dataset)))
+                        rng.shuffle(all_indices)
+                        subset_indices = all_indices[:subset_size]
+                        
+                        indices_per_process = len(subset_indices) // world_size
+                        start_idx = rank * indices_per_process
+                        end_idx = start_idx + indices_per_process if rank < world_size - 1 else len(subset_indices)
+                        my_indices = subset_indices[start_idx:end_idx]
+                        
+                        if accelerator.is_main_process:
+                            print(f'Total samples: {len(subset_indices)}, per process: ~{indices_per_process}')
+                        
+                        benchmark._evaluate_indices(my_indices, skip_compute=True)
+                        
+                        accelerator.wait_for_everyone()
+
+                        if accelerator.is_main_process:
+                            fid_score = benchmark.fid_metric.compute()
+                            print(f'Benchmark finished, FID: {fid_score.item()}')
+                            mlflow_client.log_metric(
+                                mlflow_run_id,
+                                "metrics/fid_coco",
+                                fid_score.item(),
+                                step=step_plus_one,
+                            )
+                        
+                        benchmark.fid_metric.reset()
+                        
                         del benchmark
                         torch.cuda.empty_cache()
+                    
+                    # Wait for all processes to finish benchmark
+                    accelerator.wait_for_everyone()
 
                     global_step += 1
 

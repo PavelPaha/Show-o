@@ -7,6 +7,8 @@ mlflow:
         task: "mmu"
         moe_experts: "8"
 
+mode: "t2i"
+
 experiment:
     project: "moe-training"
     name: "showo-vanilla-mmu"
@@ -15,10 +17,26 @@ experiment:
     max_train_examples_mmu: 40000000
     save_every: 3000
     eval_every: 2500
-    generate_every: 20
-    log_every: 10
+    generate_every: 500
+    log_every: 50
     log_grad_norm_every: 500
     resume_from_checkpoint: false
+
+evaluation:
+    metric_interval: 500
+    coco:
+        enabled: true
+        images_root: "/home/jovyan/vasiliev/notebooks/Show-o/train2017"
+        ann_file: "/home/jovyan/vasiliev/notebooks/Show-o/annotations/captions_train2017.json"
+        subset_size: 100 
+        batch_size: 4
+        seed: 42
+    mmu:
+        enabled: true
+        dataset_type: "mmmu"
+        subset_size: 100
+        batch_size: 4
+        seed: 42
 
 moe:
     enabled: true
@@ -34,20 +52,20 @@ moe:
     temp_start: 20.0
     temp_end: 0.5
     temp_steps: 1000
-    balance_warmup_steps: 200  
-    balance_gamma: 0.992  
+    balance_warmup_steps: 500  
+    balance_gamma: 0.999
     
-    use_modality_bias: false
-    use_domain_bias: true
+    use_modality_bias: true
+    use_domain_bias: false
     modality_init_hardness: 0.0  
     modality_init_steps: 1
     modality_init_hardness_min: 0.0  
-    domain_init_hardness: 50.0
+    domain_init_hardness: 10.0
     domain_init_steps: 1000
     domain_init_hardness_min: 0.0
     domain_to_expert_map:
-        vqav2_experiments: [0, 1, 2, 3]
-        textvqa_experiments: [4, 5, 6, 7]
+        vqav2_experiments: [0, 1, 2, 3, 4]
+        textvqa_experiments: [3, 4, 5, 6, 7]
     use_gumbel: false
     gate_capacity: [4.0, 4.0]
     random_routing: false
@@ -55,7 +73,8 @@ moe:
     noise_std: 0.01
     log_gates: True
     log_activations: True
-    log_frequency: True
+    log_frequency: 50
+    log_domain_flow_gates: True
 
 model:
     vq_model:
@@ -83,8 +102,8 @@ dataset:
 
     use_vqav2: false
     use_textvqa: false
-    use_textvqa_experiments: true  
-    use_vqav2_experiments: true
+    use_textvqa_experiments: false  
+    use_vqav2_experiments: false
     use_clevr: false
     use_docvqa: false
     use_kvasir: false
@@ -141,6 +160,7 @@ training:
     gradient_accumulation_steps: 1
     noise_type: "mask"
 
+    batch_size: ${.batch_size_t2i}
     batch_size_t2i: 2
     batch_size_lm: 1
     batch_size_mmu: 2
@@ -166,7 +186,8 @@ training:
     t2i_coeff: 1.0
     lm_coeff: 0.0
     mmu_coeff: 1.0
+    orthogonal_coeff: 0.00
 
-    balance_coeff: 0.01
+    balance_coeff: 0.001
     
     profiler_enabled: True

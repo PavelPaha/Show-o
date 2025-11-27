@@ -41,6 +41,8 @@ class ShowoBenchmark:
         config,
         coco_dataset,
         model,
+        vq_model,
+        mask_token_id,
         device="cuda:0",
         save_comparisons=False,
         output_dir="benchmark_output",
@@ -51,7 +53,7 @@ class ShowoBenchmark:
         assert config.mode == "t2i"
 
         self.config = config
-        self.steps = 10**9
+        self.steps = 10
         self.batch_size = self.config.training.batch_size
         self.coco_dataset = coco_dataset
         self.save_comparisons = save_comparisons
@@ -66,16 +68,19 @@ class ShowoBenchmark:
         #     num_workers=4
         # )
         #
-        vq_model = get_vq_model_class(config.model.vq_model.type)
-        vq_model = vq_model.from_pretrained(config.model.vq_model.vq_model_name).to(
-            device
-        )
-        vq_model.requires_grad_(False)
-        vq_model.eval()
+        # vq_model = get_vq_model_class(config.model.vq_model.type)
+        # vq_model = vq_model.from_pretrained(config.model.vq_model.vq_model_name).to(
+        #     device
+        # )
+        
+        self.vq_model = vq_model
+        self.vq_model.requires_grad_(False)
+        self.vq_model.eval()
 
         self.vq_model = vq_model
-        self.fid_metric = FrechetInceptionDistance(feature=64).to(self.device)
-        self.mask_token_id = self.model.config.mask_token_id
+        # Отключаем distributed синхронизацию для FID, т.к. бенчмарк запускается только на rank 0
+        self.fid_metric = FrechetInceptionDistance(feature=64, dist_sync_on_step=False, sync_on_compute=False).to(self.device)
+        self.mask_token_id = mask_token_id
 
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -116,7 +121,7 @@ class ShowoBenchmark:
     def _evaluate_indices(self, indices: Sequence[int]):
         config = self.config
         uni_prompting = self.uni_prompting
-        total = min(len(indices), self.steps)
+        total = len(indices)
         for start in tqdm(range(0, total, self.batch_size)):
             current_indices = indices[start : start + self.batch_size]
             batch: List[Dict[str, Any]] = transpose_batch(
@@ -241,8 +246,17 @@ class ShowoBenchmark:
                 gt_batch = torch.cat(all_gt_tensors, dim=0)
                 gen_batch = torch.cat(all_gen_tensors, dim=0)
 
+                # FID expects uint8 in [0, 255]; just move tensors onto device
+                gt_batch = gt_batch.to(self.device, non_blocking=True)
+                gen_batch = gen_batch.to(self.device, non_blocking=True)
+
                 self.fid_metric.update(gt_batch, real=True)
                 self.fid_metric.update(gen_batch, real=False)
+                processed = min(start + len(current_indices), total)
+                print(
+                    f"[Benchmark] Batch done: {processed}/{total} samples "
+                    f"(batch_size={len(current_indices)})"
+                )
                 fid_score = self.fid_metric.compute()
                 print(f"Calculated FID score: {fid_score.item()}")
 

@@ -626,7 +626,7 @@ def collect_and_log_moe_activations(
 
     if moe_modules:
         recorder.register_hooks(moe_modules)
-        _ = model(
+        _ = unwrapped_model(
             input_ids=input_ids,
             input_embeddings=None,
             attention_mask=attention_mask,

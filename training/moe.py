@@ -590,6 +590,20 @@ class MoE(nn.Module):
     def get_balance_loss(self, clear=True):
         gate_loss =  self.gate.get_loss(clear=clear)
         return gate_loss
+    
+    def get_domain_bias_hardness(self):
+        if not self.use_domain_bias:
+            return 0.0
+        
+        if self._global_step < self.domain_init_steps:
+            progress = self._global_step / max(self.domain_init_steps, 1)
+            hardness = self.domain_init_hardness - (
+                self.domain_init_hardness - self.domain_init_hardness_min
+            ) * progress
+        else:
+            hardness = self.domain_init_hardness_min
+        
+        return float(hardness)
         
 
     def _ensure_domain_buffer(self, domain_id: str):

@@ -23,7 +23,7 @@ experiment:
     resume_from_checkpoint: false
 
 evaluation:
-    metric_interval: 500
+    metric_interval: 200
     coco:
         enabled: true
         images_root: "/home/jovyan/vasiliev/notebooks/Show-o/train2017"
@@ -43,34 +43,35 @@ moe:
     num_experts: 8
     top_k: 2
     count_layers_to_patch: 6
+    freeze_base_model: false   # ❗ Размораживаем - модель должна адаптироваться к MoE!
     save_only_moe_weights: false
     learning_rate: null  
     activation_stats:
         collect_frequency: 5
 
-    temp_fixed: null
+    temp_fixed: null           # Фиксированная температура 1.0 (стабильная)
     temp_start: 20.0
-    temp_end: 0.5
+    temp_end: 1.0
     temp_steps: 1000
-    balance_warmup_steps: 500  
+    balance_warmup_steps: 500
     balance_gamma: 0.999
     
-    use_modality_bias: true
+    use_modality_bias: false   # Отключаем на первом этапе
     use_domain_bias: false
-    modality_init_hardness: 0.0  
+    modality_init_hardness: 0.0
     modality_init_steps: 1
-    modality_init_hardness_min: 0.0  
-    domain_init_hardness: 10.0
-    domain_init_steps: 1000
+    modality_init_hardness_min: 0.0
+    domain_init_hardness: 0.0
+    domain_init_steps: 1
     domain_init_hardness_min: 0.0
     domain_to_expert_map:
         vqav2_experiments: [0, 1, 2, 3, 4]
         textvqa_experiments: [3, 4, 5, 6, 7]
     use_gumbel: false
-    gate_capacity: [4.0, 4.0]
-    random_routing: false
+    gate_capacity: [2.0, 4.0]  # Увеличенный capacity (меньше pruning)
+    random_routing: false      # Отключаем
 
-    noise_std: 0.01
+    noise_std: 0.0            # ❗ БЕЗ шума - эксперты = точные копии MLP
     log_gates: True
     log_activations: True
     log_frequency: 50
@@ -142,12 +143,12 @@ dataset:
 optimizer:
     name: adamw
     params:
-        learning_rate: 0.0001
-        moe_learning_rate: 0.00001
+        learning_rate: 0.00005     # Базовая модель fine-tune
+        moe_learning_rate: 0.0002  # Gate учится быстрее (случайно инициализирован)
         scale_lr: False
         beta1: 0.9
         beta2: 0.999
-        weight_decay: 0.1
+        weight_decay: 0.01        # Уменьшенная регуляризация
         epsilon: 1e-8
 
 lr_scheduler:
@@ -188,6 +189,6 @@ training:
     mmu_coeff: 1.0
     orthogonal_coeff: 0.00
 
-    balance_coeff: 0.001
+    balance_coeff: 0.01  # Увеличили (т.к. уменьшили множитель в loss)
     
     profiler_enabled: True

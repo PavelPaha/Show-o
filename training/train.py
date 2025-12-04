@@ -823,13 +823,18 @@ def main():
         else None,
     }
 
-    model = patch_model_with_moe(
-        model,
-        config.moe,
-        mlflow_client=mlflow_client,
-        mlflow_run_id=mlflow_run_id,
-        special_tokens=special_tokens
+    if config.get("moe", {}).get("enabled", False):
+        model = patch_model_with_moe(
+            model,
+            config.moe,
+            mlflow_client=mlflow_client,
+            mlflow_run_id=mlflow_run_id,
+            special_tokens=special_tokens
         )
+        logger.info("✅ MoE patching enabled")
+    else:
+        logger.info("⏭️  MoE disabled, skipping patching")
+    
     mask_id = model.mask_token_id
 
     ##################################
@@ -1141,7 +1146,7 @@ def main():
                         #         mlflow_run_id=mlflow_run_id,
                         #     )
 
-                    should_eval_metrics = (step_plus_one == 1 or step_plus_one % metric_interval == 0)
+                    should_eval_metrics = (step_plus_one % metric_interval == 0)
                     
                     if should_eval_metrics:
                         if accelerator.is_main_process:

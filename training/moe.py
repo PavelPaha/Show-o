@@ -72,10 +72,12 @@ class MoE(nn.Module):
         num_experts = int(moe_config["num_experts"])
         top_k = int(moe_config["top_k"])
         
+        # world_size=1 для локальных экспертов (каждый GPU имеет свой набор экспертов)
+        # Если используется distributed MoE с разделением экспертов между GPU - нужно изменить
         self.gate = GShardGate(
             hidden_size, 
             num_experts, 
-            world_size=4, 
+            world_size=1,  # Локальные эксперты, без распределения между GPU
             top_k=top_k, 
             capacity=gate_capacity,
             random_routing=random_routing,
@@ -99,7 +101,7 @@ class MoE(nn.Module):
         self.domain_init_steps = int(domain_init_steps)
         self.domain_init_hardness_min = float(domain_init_hardness_min)
         self.domain_to_expert_map = domain_to_expert_map or {}
-        self.world_size = 4
+        self.world_size = 1  # Локальные эксперты
         self._domain_bias_buffer_map = {}
         for idx, (domain_name, expert_list) in enumerate(self.domain_to_expert_map.items()):
             if not expert_list:
@@ -213,14 +215,17 @@ class MoE(nn.Module):
                 total_bias = total_bias + bias
 
         gate_idx, gate_score = self.gate(hidden_states_flat, temperature=temperature, bias=total_bias)
-        # gate_idx now contains local expert indices (0 to num_experts-1) directly
+        # gate_idx: [B*L, top_k] - индексы экспертов (0..num_experts-1, или -1 если pruned)
+        # gate_score: [B*L, top_k] - уже ренормализованные веса (сумма=1 для валидных токенов)
+        
+        # Токены где ОБА эксперта pruned → используют residual connection
         overflowed_mask = (gate_idx[:, 0] == -1) & (gate_idx[:, 1] == -1)
         
         out_flat = torch.zeros(B, hidden_size, device=device, dtype=hidden_states.dtype)
         
         for k in range(self.top_k):
-            expert_indices = gate_idx[:, k]  # Local indices (0 to num_experts-1)
-            weights = gate_score[:, k]
+            expert_indices = gate_idx[:, k]
+            weights = gate_score[:, k]  # Уже ренормализованы в gate
             for expert_id in range(self.num_experts):
                 mask = (expert_indices == expert_id) & (~overflowed_mask)
                 if mask.any():

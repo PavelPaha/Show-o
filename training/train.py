@@ -11,7 +11,7 @@ import math
 from pathlib import Path
 from typing import Union
 from utils import get_optimizer
-
+import gc
 from omegaconf import OmegaConf
 import mlflow
 from mlflow.tracking import MlflowClient
@@ -64,6 +64,7 @@ from training.utils import (
 from training.moe_visualization import MoEVisualizer
 from training.moe_mlflow_logger import MoEMLflowLogger
 from training.profiling_context import get_profiling_context_torch
+from training.sample_logger import SampleLogger
 
 
 logger = get_logger(__name__, log_level="INFO")
@@ -151,9 +152,15 @@ def train_step(
     mlflow_client,
     mlflow_run_id,
     pbar,
+    sample_logger=None,
 ):
     batch_size_t2i = batch["t2i_flow"]["images"].shape[0]
-    batch_size_lm = len(batch["lm_flow"]["input_ids"])
+    # Проверяем, есть ли данные LM (может быть пустым, если batch_size_lm=0)
+    batch_size_lm = config.training.get("batch_size_lm", 0)
+    if batch_size_lm > 0 and "lm_flow" in batch and len(batch["lm_flow"]["input_ids"]) > 0:
+        batch_size_lm = len(batch["lm_flow"]["input_ids"])
+    else:
+        batch_size_lm = 0
     domain_flows = [
         "vqav2_experiments_flow",
         "textvqa_experiments_flow",
@@ -164,8 +171,8 @@ def train_step(
         "kvasir_flow",
     ]
     
-    # Will be updated after collecting all domain data
-    batch_size_mmu = 0
+    # Will be updated after collecting all domain data (если batch_size_mmu > 0)
+    batch_size_mmu = config.training.get("batch_size_mmu", 0)
     domain_id = None
     domain_ids = []
     
@@ -183,6 +190,14 @@ def train_step(
         mask_schedule,
         config.training.min_masking_rate,
     )
+    
+    # Debug: log T2I sequence shape BEFORE any padding
+    if global_step == 0 and epoch == 0:
+        logger.info(f"🔍 T2I SEQUENCE (raw from prompting):")
+        logger.info(f"   input_ids_t2i shape: {input_ids_t2i.shape}")
+        logger.info(f"   labels_t2i shape: {labels_t2i.shape}")
+        logger.info(f"   Expected: max_text_len({uni_prompting.max_text_len}) + SOI(1) + image(1024) + EOI(1) = {uni_prompting.max_text_len + 1026}")
+    
     attention_mask = create_attention_mask_predict_next(
         input_ids_t2i,
         pad_id=int(uni_prompting.sptids_dict["<|pad|>"]),
@@ -193,32 +208,39 @@ def train_step(
     )
     attention_mask = attention_mask.to(mask_dtype)
 
-    # Build LM sequences
-    texts_lm = batch["lm_flow"]["input_ids"]
-    input_ids_lm, _, labels_lm = uni_prompting(
-        (texts_lm, input_ids_t2i.shape[-1]), "lm"
-    )
-    attention_mask_lm = create_attention_mask_predict_next(
-        input_ids_lm.to(input_ids_t2i.device),
-        pad_id=int(uni_prompting.sptids_dict["<|pad|>"]),
-        soi_id=int(uni_prompting.sptids_dict["<|soi|>"]),
-        eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
-    )
-    attention_mask_lm = attention_mask_lm.to(mask_dtype)
-    attention_mask = torch.cat([attention_mask, attention_mask_lm], dim=0)
-    input_ids = torch.cat((input_ids_t2i, input_ids_lm.to(input_ids_t2i.device)), dim=0)
-    labels = torch.cat((labels_t2i, labels_lm.to(input_ids_t2i.device)), dim=0)
+    # Build LM sequences (только если batch_size_lm > 0)
+    if batch_size_lm > 0 and "lm_flow" in batch and len(batch["lm_flow"]["input_ids"]) > 0:
+        texts_lm = batch["lm_flow"]["input_ids"]
+        input_ids_lm, _, labels_lm = uni_prompting(
+            (texts_lm, input_ids_t2i.shape[-1]), "lm"
+        )
+        attention_mask_lm = create_attention_mask_predict_next(
+            input_ids_lm.to(input_ids_t2i.device),
+            pad_id=int(uni_prompting.sptids_dict["<|pad|>"]),
+            soi_id=int(uni_prompting.sptids_dict["<|soi|>"]),
+            eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
+        )
+        attention_mask_lm = attention_mask_lm.to(mask_dtype)
+        attention_mask = torch.cat([attention_mask, attention_mask_lm], dim=0)
+        input_ids = torch.cat((input_ids_t2i, input_ids_lm.to(input_ids_t2i.device)), dim=0)
+        labels = torch.cat((labels_t2i, labels_lm.to(input_ids_t2i.device)), dim=0)
+    else:
+        # Нет LM данных - используем только T2I
+        input_ids = input_ids_t2i
+        labels = labels_t2i
 
     present_domain_flows = [flow_key for flow_key in domain_flows if flow_key in batch]
     
+    # Проверяем, включен ли MMU в конфиге
+    batch_size_mmu_config = config.training.get("batch_size_mmu", 0)
     
-    # Collect MMU data from all present domain flows
+    # Collect MMU data from all present domain flows (только если batch_size_mmu > 0)
     all_mmu_input_ids = []
     all_mmu_labels = []
     all_mmu_attention_masks = []
     mmu_domain_assignments = []  # track which domain each MMU sample belongs to
     
-    if present_domain_flows:
+    if batch_size_mmu_config > 0 and present_domain_flows:
         # Process each domain flow
         for flow_key in present_domain_flows:
             
@@ -263,7 +285,7 @@ def train_step(
         batch_size_mmu = input_ids_mmu.shape[0]
         domain_id = present_domain_flows[0][:-5]  # use first domain as primary
         domain_ids = [flow[:-5] for flow in present_domain_flows]
-    elif "llava" in config.dataset.und_type:
+    elif batch_size_mmu_config > 0 and "llava" in config.dataset.und_type and "mmu_flow" in batch:
         # Fallback to mmu_flow - data is already tokenized
         pixel_values_mmu = batch["mmu_flow"]["images"]
         input_ids_mmu = batch["mmu_flow"]["input_ids"]
@@ -301,6 +323,74 @@ def train_step(
         ).to(mask_dtype)
         mmu_domain_assignments = [None] * input_ids_mmu.shape[0]
         batch_size_mmu = pixel_values_mmu.shape[0]
+    elif batch_size_mmu_config > 0 and config.dataset.und_type == "captioning" and "mmu_flow" in batch:
+        # Captioning mode - data has images and raw text captions (not tokenized)
+        pixel_values_mmu = batch["mmu_flow"]["images"]
+        captions_mmu = batch["mmu_flow"]["input_ids"]  # list of strings
+        
+        pixel_values_mmu = pixel_values_mmu.to(accelerator.device, non_blocking=True)
+        
+        # Get image tokens from VQ model
+        image_tokens_mmu = vq_model.get_code(pixel_values_mmu)
+        image_tokens_mmu = image_tokens_mmu + len(uni_prompting.text_tokenizer)
+        
+        # Tokenize captions
+        max_text_len = config.dataset.preprocessing.max_seq_length
+        
+        # Debug: log caption tokenization
+        if global_step == 0 and epoch == 0:
+            logger.info(f"🔍 MMU CAPTIONING:")
+            logger.info(f"   max_text_len for tokenization: {max_text_len}")
+            logger.info(f"   Number of captions: {len(captions_mmu)}")
+            logger.info(f"   First caption: {captions_mmu[0][:100] if captions_mmu else 'N/A'}...")
+        
+        tokenized = uni_prompting.text_tokenizer(
+            captions_mmu,
+            padding="max_length",
+            truncation=True,
+            max_length=max_text_len,
+            return_tensors="pt",
+        )
+        text_input_ids = tokenized["input_ids"].to(accelerator.device)
+        
+        # Debug: log tokenized text shape
+        if global_step == 0 and epoch == 0:
+            logger.info(f"   text_input_ids shape after tokenization: {text_input_ids.shape}")
+            logger.info(f"   image_tokens_mmu shape: {image_tokens_mmu.shape}")
+        
+        # Create input sequence: <|mmu|> <|soi|> image_tokens <|eoi|> text_tokens
+        batch_size_caption = pixel_values_mmu.shape[0]
+        input_ids_mmu = torch.cat([
+            (torch.ones(batch_size_caption, 1) * uni_prompting.sptids_dict['<|mmu|>']).to(accelerator.device),
+            (torch.ones(batch_size_caption, 1) * uni_prompting.sptids_dict['<|soi|>']).to(accelerator.device),
+            image_tokens_mmu,
+            (torch.ones(batch_size_caption, 1) * uni_prompting.sptids_dict['<|eoi|>']).to(accelerator.device),
+            text_input_ids,
+        ], dim=1).long()
+        
+        # Debug: log final MMU sequence shape
+        if global_step == 0 and epoch == 0:
+            logger.info(f"   Final input_ids_mmu shape: {input_ids_mmu.shape}")
+            logger.info(f"   Expected: MMU(1) + SOI(1) + image(1024) + EOI(1) + text({max_text_len}) = {1 + 1 + 1024 + 1 + max_text_len}")
+        
+        # Create labels: ignore special tokens and image tokens, predict text tokens
+        labels_mmu = torch.cat([
+            (torch.ones(batch_size_caption, 1) * uni_prompting.ignore_id).to(accelerator.device),  # <|mmu|>
+            (torch.ones(batch_size_caption, 1) * uni_prompting.ignore_id).to(accelerator.device),  # <|soi|>
+            torch.ones_like(image_tokens_mmu) * uni_prompting.ignore_id,  # image tokens
+            (torch.ones(batch_size_caption, 1) * uni_prompting.ignore_id).to(accelerator.device),  # <|eoi|>
+            text_input_ids.clone(),  # text labels (predict caption)
+        ], dim=1).long()
+        
+        # Mask padding tokens in labels
+        labels_mmu[labels_mmu == uni_prompting.text_tokenizer.pad_token_id] = uni_prompting.ignore_id
+        
+        attention_mask_mmu = create_attention_mask_for_mmu(
+            input_ids_mmu,
+            eoi_id=int(uni_prompting.sptids_dict["<|eoi|>"]),
+        ).to(mask_dtype)
+        mmu_domain_assignments = [None] * batch_size_caption
+        batch_size_mmu = batch_size_caption
     else:
         # No MMU data
         input_ids_mmu = torch.empty((0, input_ids.shape[1]), dtype=input_ids.dtype, device=input_ids.device)
@@ -311,15 +401,23 @@ def train_step(
     
     # Debug: log shapes on first step
     if global_step == 0 and epoch == 0:
-        logger.info(f"input_ids shape: {input_ids.shape}")
-        logger.info(f"input_ids_mmu shape: {input_ids_mmu.shape}")
-        logger.info(f"attention_mask shape: {attention_mask.shape}")
-        logger.info(f"attention_mask_mmu shape: {attention_mask_mmu.shape}")
-        logger.info(f"labels shape: {labels.shape}")
-        logger.info(f"labels_mmu shape: {labels_mmu.shape}")
+        logger.info(f"🔍 BEFORE PADDING:")
+        logger.info(f"   T2I input_ids shape: {input_ids.shape}")
+        logger.info(f"   MMU input_ids_mmu shape: {input_ids_mmu.shape}")
+        logger.info(f"   T2I attention_mask shape: {attention_mask.shape}")
+        logger.info(f"   MMU attention_mask_mmu shape: {attention_mask_mmu.shape}")
+        logger.info(f"   T2I labels shape: {labels.shape}")
+        logger.info(f"   MMU labels_mmu shape: {labels_mmu.shape}")
+        logger.info(f"   Config max_seq_length: {config.dataset.preprocessing.max_seq_length}")
+        logger.info(f"   uni_prompting.max_text_len: {uni_prompting.max_text_len}")
     
     # Pad sequences to the same length if needed
-    max_len = max(input_ids.shape[1], input_ids_mmu.shape[1])
+    if batch_size_mmu > 0 and input_ids_mmu.shape[0] > 0:
+        max_len = max(input_ids.shape[1], input_ids_mmu.shape[1])
+        if global_step == 0 and epoch == 0:
+            logger.info(f"   Padding to max_len={max_len} (T2I={input_ids.shape[1]}, MMU={input_ids_mmu.shape[1]})")
+    else:
+        max_len = input_ids.shape[1]
     
     if input_ids.shape[1] < max_len:
         pad_len = max_len - input_ids.shape[1]
@@ -328,16 +426,18 @@ def train_step(
         attention_mask = torch.cat([attention_mask, torch.full((attention_mask.shape[0], 1, attention_mask.shape[2], pad_len), torch.finfo(mask_dtype).min, dtype=mask_dtype, device=attention_mask.device)], dim=3)
         attention_mask = torch.cat([attention_mask, torch.full((attention_mask.shape[0], 1, pad_len, max_len), torch.finfo(mask_dtype).min, dtype=mask_dtype, device=attention_mask.device)], dim=2)
     
-    if input_ids_mmu.shape[1] < max_len:
-        pad_len = max_len - input_ids_mmu.shape[1]
-        input_ids_mmu = torch.cat([input_ids_mmu, torch.full((input_ids_mmu.shape[0], pad_len), uni_prompting.pad_id, dtype=input_ids_mmu.dtype, device=input_ids_mmu.device)], dim=1)
-        labels_mmu = torch.cat([labels_mmu, torch.full((labels_mmu.shape[0], pad_len), uni_prompting.ignore_id, dtype=labels_mmu.dtype, device=labels_mmu.device)], dim=1)
-        attention_mask_mmu = torch.cat([attention_mask_mmu, torch.full((attention_mask_mmu.shape[0], 1, attention_mask_mmu.shape[2], pad_len), torch.finfo(mask_dtype).min, dtype=mask_dtype, device=attention_mask_mmu.device)], dim=3)
-        attention_mask_mmu = torch.cat([attention_mask_mmu, torch.full((attention_mask_mmu.shape[0], 1, pad_len, max_len), torch.finfo(mask_dtype).min, dtype=mask_dtype, device=attention_mask_mmu.device)], dim=2)
-    
-    attention_mask = torch.cat([attention_mask, attention_mask_mmu], dim=0)
-    input_ids = torch.cat((input_ids, input_ids_mmu.to(input_ids.device)), dim=0)
-    labels = torch.cat((labels, labels_mmu.to(input_ids.device)), dim=0)
+    if batch_size_mmu > 0 and input_ids_mmu.shape[0] > 0:
+        if input_ids_mmu.shape[1] < max_len:
+            pad_len = max_len - input_ids_mmu.shape[1]
+            input_ids_mmu = torch.cat([input_ids_mmu, torch.full((input_ids_mmu.shape[0], pad_len), uni_prompting.pad_id, dtype=input_ids_mmu.dtype, device=input_ids_mmu.device)], dim=1)
+            labels_mmu = torch.cat([labels_mmu, torch.full((labels_mmu.shape[0], pad_len), uni_prompting.ignore_id, dtype=labels_mmu.dtype, device=labels_mmu.device)], dim=1)
+            attention_mask_mmu = torch.cat([attention_mask_mmu, torch.full((attention_mask_mmu.shape[0], 1, attention_mask_mmu.shape[2], pad_len), torch.finfo(mask_dtype).min, dtype=mask_dtype, device=attention_mask_mmu.device)], dim=3)
+            attention_mask_mmu = torch.cat([attention_mask_mmu, torch.full((attention_mask_mmu.shape[0], 1, pad_len, max_len), torch.finfo(mask_dtype).min, dtype=mask_dtype, device=attention_mask_mmu.device)], dim=2)
+        
+        attention_mask = torch.cat([attention_mask, attention_mask_mmu], dim=0)
+        input_ids = torch.cat((input_ids, input_ids_mmu.to(input_ids.device)), dim=0)
+        labels = torch.cat((labels, labels_mmu.to(input_ids.device)), dim=0)
+    # Если batch_size_mmu=0, то input_ids, labels, attention_mask уже содержат только T2I (+ LM если есть)
     
     # Create sample_domains: simple list where each element is the domain of that sample
     # [batch_size] where each element is domain name (None for T2I/LM, domain name for MMU)
@@ -353,11 +453,25 @@ def train_step(
         logger.info(f"Step {global_step}: batch sizes: t2i={batch_size_t2i}, lm={batch_size_lm}, mmu={len(mmu_domain_assignments)}, total={batch_size_total}")
 
     if global_step == 0 and epoch == 0:
+        logger.info(f"🔍 AFTER PADDING:")
+        logger.info(f"   Final input_ids shape: {input_ids.shape}")
+        logger.info(f"   Final labels shape: {labels.shape}")
+        logger.info(f"   Final attention_mask shape: {attention_mask.shape}")
+        
         logger.info(f"📊 First training step diagnostics:")
         logger.info(f"   input_ids shape: {input_ids.shape}")
         logger.info(f"   input_ids range: [{input_ids.min().item()}, {input_ids.max().item()}]")
         logger.info(f"   labels range (non-ignore): [{labels[labels != uni_prompting.ignore_id].min().item()}, {labels[labels != uni_prompting.ignore_id].max().item()}]")
         logger.info(f"   mask_id used: {mask_id}")
+        
+        # Log sample token distribution
+        for i in range(min(2, input_ids.shape[0])):
+            sample = input_ids[i]
+            pad_count = (sample == uni_prompting.pad_id).sum().item()
+            mask_count = (sample == mask_id).sum().item()
+            soi_count = (sample == int(uni_prompting.sptids_dict['<|soi|>'])).sum().item()
+            eoi_count = (sample == int(uni_prompting.sptids_dict['<|eoi|>'])).sum().item()
+            logger.info(f"   Sample {i}: pad={pad_count}, mask={mask_count}, soi={soi_count}, eoi={eoi_count}")
         logger.info(f"   text_tokenizer size: {len(uni_prompting.text_tokenizer)}")
         logger.info(f"   Expected image token range: [{len(uni_prompting.text_tokenizer)}, {len(uni_prompting.text_tokenizer) + 8192 - 1}]")
 
@@ -382,23 +496,116 @@ def train_step(
         moe_sample_domains=sample_domains,
     )
     
+    # Диагностика t2i loss
+    if global_step <= 5 or global_step % 100 == 0:
+        if batch_size_t2i > 0:
+            # Проверяем, что в labels есть не-ignore значения для t2i части
+            t2i_labels = labels[:batch_size_t2i, config.dataset.preprocessing.max_seq_length + 1 :]
+            non_ignore_count = (t2i_labels != uni_prompting.ignore_id).sum().item()
+            total_t2i_tokens = t2i_labels.numel()
+            logger.info(
+                f"🔍 Step {global_step}: t2i diagnostics - "
+                f"batch_size_t2i={batch_size_t2i}, "
+                f"loss_t2i={loss_t2i.item():.4f}, "
+                f"non_ignore_labels={non_ignore_count}/{total_t2i_tokens}, "
+                f"mask_prob={mask_prob.mean().item():.4f}, "
+                f"loss_t2i.requires_grad={loss_t2i.requires_grad}"
+            )
+            if non_ignore_count == 0:
+                logger.warning(f"⚠️ Step {global_step}: Все t2i labels игнорируются! Loss может быть 0 или nan.")
+            if torch.isnan(loss_t2i) or torch.isinf(loss_t2i):
+                logger.error(f"❌ Step {global_step}: loss_t2i is nan/inf!")
+        else:
+            logger.warning(f"⚠️ Step {global_step}: batch_size_t2i = 0, t2i loss не вычисляется!")
+
+    # Log samples for debugging
+    if sample_logger is not None and sample_logger.should_log(global_step):
+        # Log batch summary
+        sample_logger.log_batch_summary(
+            global_step=global_step,
+            batch_size_t2i=batch_size_t2i,
+            batch_size_lm=batch_size_lm,
+            batch_size_mmu=batch_size_mmu,
+            total_seq_length=input_ids.shape[1],
+            mask_prob_mean=mask_prob.mean().item() if torch.is_tensor(mask_prob) else mask_prob,
+        )
+        
+        # Log T2I samples
+        for i in range(min(batch_size_t2i, sample_logger.max_samples_per_step)):
+            sample_logger.log_t2i_sample(
+                global_step=global_step,
+                batch_idx=i,
+                input_ids=input_ids[i],
+                labels=labels[i],
+                original_text=texts[i] if i < len(texts) else "",
+                mask_prob=mask_prob[i].item() if torch.is_tensor(mask_prob) and mask_prob.dim() > 0 else mask_prob,
+                image_tokens_ori=image_tokens_ori[i] if image_tokens_ori is not None else None,
+            )
+        
+        # Log LM samples
+        lm_start_idx = batch_size_t2i
+        for i in range(min(batch_size_lm, sample_logger.max_samples_per_step)):
+            idx = lm_start_idx + i
+            lm_text = batch["lm_flow"]["input_ids"][i] if "lm_flow" in batch and i < len(batch["lm_flow"]["input_ids"]) else ""
+            sample_logger.log_lm_sample(
+                global_step=global_step,
+                batch_idx=i,
+                input_ids=input_ids[idx],
+                labels=labels[idx],
+                original_text=lm_text[:200] if isinstance(lm_text, str) else str(lm_text)[:200],
+            )
+        
+        # Log MMU samples
+        mmu_start_idx = batch_size_t2i + batch_size_lm
+        for i in range(min(batch_size_mmu, sample_logger.max_samples_per_step)):
+            idx = mmu_start_idx + i
+            domain = mmu_domain_assignments[i] if i < len(mmu_domain_assignments) else None
+            sample_logger.log_mmu_sample(
+                global_step=global_step,
+                batch_idx=i,
+                input_ids=input_ids[idx],
+                labels=labels[idx],
+                domain=domain,
+            )
 
     # Gather the losses across all processes for logging (if we use distributed training).
-    avg_loss_t2i = accelerator.gather(
-        loss_t2i.repeat(config.training.batch_size_t2i)
-    ).mean()
-    avg_loss_lm = accelerator.gather(
-        loss_lm.repeat(config.training.batch_size_lm)
-    ).mean()
-    avg_loss_mmu = accelerator.gather(
-        loss_mmu.repeat(config.training.batch_size_mmu)
-    ).mean()
+    # ВАЖНО: loss_t2i уже усреднён по батчу (из F.cross_entropy с reduction='mean')
+    # Для distributed training мы повторяем его batch_size_t2i раз, собираем и усредняем
+    # Для одного GPU это просто возвращает loss_t2i
+    if batch_size_t2i > 0:
+        avg_loss_t2i = accelerator.gather(
+            loss_t2i.repeat(config.training.batch_size_t2i)
+        ).mean()
+    else:
+        avg_loss_t2i = torch.tensor(0.0, device=loss_t2i.device)
+    if batch_size_lm > 0:
+        avg_loss_lm = accelerator.gather(
+            loss_lm.repeat(batch_size_lm)
+        ).mean()
+    else:
+        avg_loss_lm = torch.tensor(0.0, device=loss_lm.device)
+    if batch_size_mmu > 0:
+        avg_loss_mmu = accelerator.gather(
+            loss_mmu.repeat(batch_size_mmu)
+        ).mean()
+    else:
+        avg_loss_mmu = torch.tensor(0.0, device=loss_mmu.device)
 
+    # MoE losses/coeff only if MoE enabled
+    if config.get("moe", {}).get("enabled", False):
     balance_loss, orthogonal_loss, num_moe_layers = collect_moe_balance_losses(model)
     if num_moe_layers == 0:
         logger.warning(f"⚠️ MoE enabled but num_moe_layers = {num_moe_layers}")
-        
+            # Не логируем, если MoE фактически нет
+            should_log_layer_expert = False
     balance_coeff = balance_scheduler.get_last_lr()[0]
+    else:
+        # MoE выключен — ставим нули и не логируем
+        zero = loss_t2i.new_tensor(0.0)
+        balance_loss, orthogonal_loss = zero, zero
+        num_moe_layers = 0
+        balance_coeff = 0.0
+        should_log_layer_expert = False
 
     if (
         should_log_layer_expert
@@ -406,6 +613,7 @@ def train_step(
         and mlflow_client is not None
         and mlflow_run_id is not None
     ):
+        # Сбор статистики в отдельном блоке для освобождения памяти
         unwrapped_model = accelerator.unwrap_model(model)
         collector = LayerExpertStatsCollector(unwrapped_model)
         layer_expert_counts_by_modality, probability_map = collector.collect(global_step)
@@ -414,28 +622,54 @@ def train_step(
             raise Exception("No moe layers")
         visualizer = MoEVisualizer(num_experts=config.moe.num_experts)
         mlflow_logger = MoEMLflowLogger(mlflow_client=mlflow_client, mlflow_run_id=mlflow_run_id)
-        # print(f'{layer_expert_counts_by_modality=}')
         
         for modality, layer_expert_counts in layer_expert_counts_by_modality.items():
-            # print(f'[layer_expert_counts_by_modality] {modality=}, {layer_expert_counts=}')
             heatmap_bytes = visualizer.create_layer_expert_activation_heatmap(
                 layer_expert_counts, global_step=global_step + 1
             )
             mlflow_logger.log_layer_expert_heatmap(global_step + 1, heatmap_bytes, suffix=modality)
+            del heatmap_bytes
 
         for modality, layer_probabilities in probability_map.items():
-            # print(f'[probability_map] {modality=}, {layer_expert_counts=}')
             prob_heatmap = visualizer.create_layer_probability_heatmap(
                 layer_probabilities, modality, global_step
             )
             mlflow_logger.log_layer_probability_heatmap(
                 global_step + 1, prob_heatmap, suffix=modality
             )
+            del prob_heatmap
+        
+        
+        # Явно освобождаем объекты и GPU память
+        del layer_expert_counts_by_modality, probability_map, collector, visualizer, mlflow_logger
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        
+        if global_step <= 5:
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            logger.info(f"🔧 Step {global_step}: After MoE stats cleanup - GPU allocated: {allocated:.2f}GB, reserved: {reserved:.2f}GB")
     
-    # Синхронизируем все процессы после логирования MoE статистики (может занимать много времени)
+    # Синхронизируем все процессы после логирования MoE статистики
     if should_log_layer_expert:
         accelerator.wait_for_everyone()
 
+    # Проверка, что t2i loss валиден и участвует в общем loss
+    if batch_size_t2i > 0:
+        if torch.isnan(loss_t2i) or torch.isinf(loss_t2i):
+            logger.error(f"❌ Step {global_step}: loss_t2i is nan/inf, заменяем на 0")
+            loss_t2i = torch.tensor(0.0, device=loss_t2i.device, requires_grad=True)
+        if loss_t2i.item() == 0.0:
+            logger.warning(f"⚠️ Step {global_step}: loss_t2i = 0.0, возможно все labels игнорируются!")
+    
+    # Проверка MoE losses на NaN
+    if torch.is_tensor(balance_loss) and (torch.isnan(balance_loss) or torch.isinf(balance_loss)):
+        logger.error(f"❌ Step {global_step}: balance_loss is nan/inf ({balance_loss.item()}), заменяем на 0")
+        balance_loss = torch.tensor(0.0, device=loss_t2i.device, requires_grad=True)
+    if torch.is_tensor(orthogonal_loss) and (torch.isnan(orthogonal_loss) or torch.isinf(orthogonal_loss)):
+        logger.error(f"❌ Step {global_step}: orthogonal_loss is nan/inf ({orthogonal_loss.item()}), заменяем на 0")
+        orthogonal_loss = torch.tensor(0.0, device=loss_t2i.device, requires_grad=True)
+    
     loss = (
         config.training.t2i_coeff * loss_t2i
         + config.training.lm_coeff * loss_lm
@@ -443,43 +677,60 @@ def train_step(
         + balance_coeff * balance_loss
         + config.training.orthogonal_coeff * orthogonal_loss
     )
+    
+    # Диагностика общего loss
+    if global_step <= 5 or global_step % 100 == 0:
+        logger.info(
+            f"📊 Step {global_step}: Total loss breakdown - "
+            f"t2i_contrib={config.training.t2i_coeff * loss_t2i.item():.4f}, "
+            f"mmu_contrib={config.training.mmu_coeff * loss_mmu.item():.4f}, "
+            f"total={loss.item():.4f}"
+        )
 
-    if accelerator.is_main_process and mlflow_client is not None and mlflow_run_id is not None:
-        step_idx = global_step + 1
-        loss_metrics = {
-            "loss/total": loss.item(),
-            "loss/t2i": avg_loss_t2i.item(),
-            "loss/lm": avg_loss_lm.item(),
-            "loss/mmu": avg_loss_mmu.item(),
-            "loss/balance": balance_loss.item(),
-            "loss/orthogonal": orthogonal_loss.item(),
-        }
-        try:
-            for metric_name, metric_value in loss_metrics.items():
-                mlflow_client.log_metric(mlflow_run_id, metric_name, metric_value, step=step_idx)
-        except Exception as logging_err:
-            logger.warning(f"Failed to log per-step losses to MLflow: {logging_err}")
+    # NOTE: Логирование loss перенесено в main loop для корректного усреднения по gradient accumulation steps
+    # Метрики логируются как loss/t2i, loss/lm, loss/mmu, loss/balance, loss/orthogonal
 
     avg_masking_rate = accelerator.gather(
         mask_prob.repeat(config.training.batch_size_t2i)
     ).mean()
 
+    # Диагностика GPU памяти перед backward
+    if global_step <= 5:
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        logger.info(f"🔧 Step {global_step}: Before backward - GPU allocated: {allocated:.2f}GB, reserved: {reserved:.2f}GB")
+
     # Backward pass
     accelerator.backward(loss)
+    
+    # Проверка градиентов для t2i loss (только для диагностики)
+        # if (global_step <= 5 or global_step % 100 == 0) and batch_size_t2i > 0:
+        #     try:
+        #         unwrapped_model = accelerator.unwrap_model(model)
+        #         # Проверяем градиенты в первом слое модели
+        #         if hasattr(unwrapped_model, 'showo') and hasattr(unwrapped_model.showo, 'model'):
+        #             first_param = next(unwrapped_model.showo.model.parameters())
+        #             if first_param.grad is not None:
+        #                 grad_norm = first_param.grad.norm().item()
+        #                 logger.info(f"🔍 Step {global_step}: Gradient norm (first param) = {grad_norm:.6f}")
+        #             else:
+        #                 logger.warning(f"⚠️ Step {global_step}: Градиенты отсутствуют в первом параметре!")
+        #     except Exception as e:
+        #         logger.debug(f"Не удалось проверить градиенты: {e}")
 
-    if (
-        torch.cuda.is_available()
-        and (global_step + 1) % config.training.gradient_accumulation_steps == 0
-    ):
+    # Очистка CUDA кэша после каждого accumulation cycle
+    if torch.cuda.is_available() and accelerator.sync_gradients:
         torch.cuda.empty_cache()
 
     if config.training.max_grad_norm is not None and accelerator.sync_gradients:
         accelerator.clip_grad_norm_(model.parameters(), config.training.max_grad_norm)
 
     optimizer.step()
-    lr_scheduler.step()
-    balance_scheduler.step()
-    temp_scheduler.step()
+    # Update ALL schedulers only on global steps (not micro-batches)
+    if accelerator.sync_gradients:
+        lr_scheduler.step()
+        balance_scheduler.step()
+        temp_scheduler.step()
 
     # log gradient norm before zeroing it
     if (
@@ -561,6 +812,7 @@ def train_step(
         "avg_loss_lm": avg_loss_lm,
         "avg_loss_mmu": avg_loss_mmu,
         "balance_loss": balance_loss,
+        "orthogonal_loss": orthogonal_loss,
         "avg_masking_rate": avg_masking_rate,
         "logits": logits,
         "input_ids": input_ids,
@@ -595,15 +847,19 @@ def collect_moe_balance_losses(model):
     for layer_idx, layer in enumerate(unwrapped_model.showo.model.layers):
         if hasattr(layer, "mlp") and hasattr(layer.mlp, "gate"):
             gate_loss = layer.mlp.get_balance_loss()
-            total_balance_loss += gate_loss
+            total_balance_loss = total_balance_loss + gate_loss
             
             gate_weights.append(layer.mlp.gate.gate.weight)
             num_moe_layers += 1
             logger.debug(f"MoE layer {layer_idx}: balance_loss = {gate_loss.item():.6f}")
+    
+    # Нет MoE слоёв или gate_weights пуст — вернуть нули, но с grad
+    if num_moe_layers == 0 or len(gate_weights) == 0:
+        zero = next(unwrapped_model.parameters()).new_tensor(0.0, requires_grad=True)
+        return zero, zero, num_moe_layers
             
     gate_weights = torch.cat(gate_weights, dim=0)
     orthogonal_loss = router_orth_loss(gate_weights)
-    print(f'{orthogonal_loss=}')
             
     return total_balance_loss, orthogonal_loss, num_moe_layers
 
@@ -620,13 +876,39 @@ def get_vq_model_class(model_type):
 def main():
     config = get_config()
 
-    # Enable TF32 on Ampere GPUs
+    config.experiment.logging_dir = str(Path(config.experiment.output_dir) / "logs")
+
+    #####################################
+    # SET SEED FIRST - before anything else #
+    # Это критично для детерминированности всей инициализации #
+    # Используем обычный print, т.к. accelerate logger требует инициализации #
+    #####################################
+    if config.training.seed is not None:
+        seed = config.training.seed
+        print(f"🌱 Setting seed to {seed} (BEFORE Accelerator initialization)")
+        set_seed(seed)
+        # Дополнительная установка сидов для полной детерминированности
+        import random
+        import numpy as np
+        random.seed(seed)
+        np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        print(f"✅ Seed {seed} set for: torch, numpy, random, cuda")
+    else:
+        print("⚠️  No seed specified in config.training.seed - training will be non-deterministic!")
+
+    # Enable TF32 on Ampere GPUs (после установки сида)
     if config.training.enable_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
-
-    config.experiment.logging_dir = str(Path(config.experiment.output_dir) / "logs")
+        print("⚡ TF32 enabled (cudnn.deterministic=False for performance)")
+    else:
+        # Для полной детерминированности (может замедлить обучение)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print("🔒 Full determinism enabled (cudnn.deterministic=True)")
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     
@@ -646,14 +928,14 @@ def main():
 
     total_batch_size_per_gpu = (
         config.training.batch_size_t2i
-        + config.training.batch_size_lm
-        + config.training.batch_size_mmu
+        + config.training.get("batch_size_lm", 0)
+        + config.training.get("batch_size_mmu", 0)
     )
     total_batch_size = (
         (
             config.training.batch_size_t2i
-            + config.training.batch_size_lm
-            + config.training.batch_size_mmu
+            + config.training.get("batch_size_lm", 0)
+            + config.training.get("batch_size_mmu", 0)
         )
         * accelerator.num_processes
         * config.training.gradient_accumulation_steps
@@ -705,13 +987,13 @@ def main():
         mlflow_run_id = run.info.run_id
 
         mlflow_client.log_param(
-            mlflow_run_id, "batch_size_mmu", config.training.batch_size_mmu
+            mlflow_run_id, "batch_size_mmu", config.training.get("batch_size_mmu", 0)
         )
         mlflow_client.log_param(
             mlflow_run_id, "batch_size_t2i", config.training.batch_size_t2i
         )
         mlflow_client.log_param(
-            mlflow_run_id, "batch_size_lm", config.training.batch_size_lm
+            mlflow_run_id, "batch_size_lm", config.training.get("batch_size_lm", 0)
         )
         mlflow_client.log_param(
             mlflow_run_id, "learning_rate", config.optimizer.params.learning_rate
@@ -736,10 +1018,17 @@ def main():
         config_path = Path(config.experiment.output_dir) / "config.yaml"
         logging.info(f"Saving config to {config_path}")
         OmegaConf.save(config, config_path)
+        
+        # Сохраняем конфиг в MLflow как артефакт
+        if mlflow_client is not None and mlflow_run_id is not None:
+            try:
+                mlflow_client.log_artifact(mlflow_run_id, str(config_path))
+                logger.info(f"📄 Config saved to MLflow as artifact: config.yaml")
+            except Exception as e:
+                logger.warning(f"Failed to save config to MLflow: {e}")
 
-    # If passed along, set the training seed now.
-    if config.training.seed is not None:
-        set_seed(config.training.seed)
+    # Seed уже установлен выше, перед инициализацией Accelerator
+    # Это гарантирует детерминированность всей инициализации
 
     #########################
     # MODELS and OPTIMIZER  #
@@ -770,6 +1059,20 @@ def main():
     )
 
     # print("special tokens : \n", uni_prompting.sptids_dict)
+
+    # Sample logger for debugging training data
+    sample_logger = None
+    if accelerator.is_main_process and config.get("sample_logging", {}).get("enabled", False):
+        sample_log_dir = os.path.join(config.experiment.output_dir, "sample_logs")
+        sample_logger = SampleLogger(
+            log_dir=sample_log_dir,
+            text_tokenizer=tokenizer,
+            log_every_n_steps=config.get("sample_logging", {}).get("log_every_n_steps", 100),
+            max_samples_per_step=config.get("sample_logging", {}).get("max_samples_per_step", 2),
+            enabled=True,
+        )
+        sample_logger.set_special_tokens(uni_prompting.sptids_dict)
+        logger.info(f"📝 Sample logging enabled: {sample_log_dir}")
 
     # VQ model for processing image into discrete tokens
     vq_model = get_vq_model_class(config.model.vq_model.type)
@@ -916,8 +1219,8 @@ def main():
         temp_scheduler = LambdaLR(temp_optimizer, lr_lambda=_constant_factor)
     else:
         # Scheduler с изменением температуры
-        temp_start = float(config.moe["temp_start"]) if "temp_start" in config.moe else 100.0
-        temp_end = float(config.moe["temp_end"]) if "temp_end" in config.moe else 1.0
+        temp_start = float(config.moe["temp_start"])
+        temp_end = float(config.moe["temp_end"])
         temp_steps = int(config.moe["temp_steps"]) if "temp_steps" in config.moe else int(config.training.max_train_steps)
         _temp_dummy_param = nn.Parameter(torch.zeros((), device=accelerator.device))
         temp_optimizer = torch.optim.SGD([{"params": [_temp_dummy_param], "lr": temp_start}])
@@ -1015,6 +1318,15 @@ def main():
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
     end = time.time()
+    
+    # Накопление loss для усреднения по gradient accumulation steps
+    accumulated_loss_t2i = 0.0
+    accumulated_loss_lm = 0.0
+    accumulated_loss_mmu = 0.0
+    accumulated_balance_loss = 0.0
+    accumulated_orthogonal_loss = 0.0
+    accumulated_masking_rate = 0.0
+    accumulation_count = 0
 
     for epoch in range(first_epoch, num_train_epochs):
         model.train()
@@ -1056,6 +1368,7 @@ def main():
                         mlflow_client=mlflow_client,
                         mlflow_run_id=mlflow_run_id,
                         pbar=pbar,
+                        sample_logger=sample_logger,
                     )
 
                 input_ids = step_outputs["input_ids"]
@@ -1068,14 +1381,72 @@ def main():
                 image_tokens_ori = step_outputs["image_tokens_ori"]
                 texts = step_outputs["texts"]
                 logits = step_outputs["logits"]
-                # avg_loss_t2i = step_outputs["avg_loss_t2i"]
-                # avg_loss_lm = step_outputs["avg_loss_lm"]
-                # avg_loss_mmu = step_outputs["avg_loss_mmu"]
-                # balance_loss = step_outputs["balance_loss"]
-                # avg_masking_rate = step_outputs["avg_masking_rate"]
+                
+                # Накапливаем loss для усреднения по gradient accumulation steps
+                avg_loss_t2i = step_outputs["avg_loss_t2i"]
+                avg_loss_lm = step_outputs["avg_loss_lm"]
+                avg_loss_mmu = step_outputs["avg_loss_mmu"]
+                avg_masking_rate = step_outputs["avg_masking_rate"]
+                balance_loss = step_outputs["balance_loss"]
+                orthogonal_loss = step_outputs["orthogonal_loss"]
+                
+                accumulated_loss_t2i += avg_loss_t2i.item() if torch.is_tensor(avg_loss_t2i) else avg_loss_t2i
+                accumulated_loss_lm += avg_loss_lm.item() if torch.is_tensor(avg_loss_lm) else avg_loss_lm
+                accumulated_loss_mmu += avg_loss_mmu.item() if torch.is_tensor(avg_loss_mmu) else avg_loss_mmu
+                accumulated_balance_loss += balance_loss.item() if torch.is_tensor(balance_loss) else balance_loss
+                accumulated_orthogonal_loss += orthogonal_loss.item() if torch.is_tensor(orthogonal_loss) else orthogonal_loss
+                accumulated_masking_rate += avg_masking_rate.item() if torch.is_tensor(avg_masking_rate) else avg_masking_rate
+                accumulation_count += 1
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
+                    # Усредняем накопленные loss по gradient accumulation steps
+                    if accumulation_count > 0:
+                        # ВАЖНО: Усредняем по количеству микробатчей (accumulation_count)
+                        # Каждый микробатч уже имеет усреднённый loss (из F.cross_entropy с reduction='mean')
+                        # Поэтому мы просто усредняем эти усреднённые значения по микробатчам
+                        mean_loss_t2i = accumulated_loss_t2i / accumulation_count
+                        mean_loss_lm = accumulated_loss_lm / accumulation_count
+                        mean_loss_mmu = accumulated_loss_mmu / accumulation_count
+                        mean_balance_loss = accumulated_balance_loss / accumulation_count
+                        mean_orthogonal_loss = accumulated_orthogonal_loss / accumulation_count
+                        mean_masking_rate = accumulated_masking_rate / accumulation_count
+                        
+                        # Диагностика: проверяем, что accumulation_count соответствует ожидаемому
+                        expected_accumulation = config.training.gradient_accumulation_steps
+                        if accumulation_count != expected_accumulation and (global_step + 1) % config.experiment.log_every == 0:
+                            logger.warning(
+                                f"⚠️ Step {global_step + 1}: accumulation_count={accumulation_count} != "
+                                f"expected={expected_accumulation}. Это может указывать на проблему с gradient accumulation."
+                            )
+                        
+                        # Логируем усреднённые значения в MLflow
+                        if mlflow_client is not None and mlflow_run_id is not None:
+                            try:
+                                mlflow_client.log_metric(mlflow_run_id, "loss/t2i", mean_loss_t2i, step=global_step + 1)
+                                mlflow_client.log_metric(mlflow_run_id, "loss/lm", mean_loss_lm, step=global_step + 1)
+                                mlflow_client.log_metric(mlflow_run_id, "loss/mmu", mean_loss_mmu, step=global_step + 1)
+                                mlflow_client.log_metric(mlflow_run_id, "loss/balance", mean_balance_loss, step=global_step + 1)
+                                mlflow_client.log_metric(mlflow_run_id, "loss/orthogonal", mean_orthogonal_loss, step=global_step + 1)
+                                mlflow_client.log_metric(mlflow_run_id, "masking_rate", mean_masking_rate, step=global_step + 1)
+                            except Exception as e:
+                                logger.warning(f"Failed to log accumulated losses: {e}")
+                        
+                        if (global_step + 1) % config.experiment.log_every == 0:
+                            logger.info(
+                                f"📊 Step {global_step + 1}: Avg over {accumulation_count} micro-batches - "
+                                f"loss_t2i={mean_loss_t2i:.4f}, loss_mmu={mean_loss_mmu:.4f}, mask_rate={mean_masking_rate:.4f}"
+                            )
+                    
+                    # Сбрасываем накопители
+                    accumulated_loss_t2i = 0.0
+                    accumulated_loss_lm = 0.0
+                    accumulated_loss_mmu = 0.0
+                    accumulated_balance_loss = 0.0
+                    accumulated_orthogonal_loss = 0.0
+                    accumulated_masking_rate = 0.0
+                    accumulation_count = 0
+                    
                     batch_time_m.update(time.time() - end)
                     end = time.time()
                     if (
@@ -1101,7 +1472,7 @@ def main():
                         accelerator.wait_for_everyone()
 
                     step_plus_one = global_step + 1
-                    should_generate = step_plus_one % config.experiment.generate_every == 0
+                    should_generate = global_step % config.experiment.generate_every == 0
                     if should_generate and accelerator.is_main_process:
                         logger.info(
                             f"🎨 Step {step_plus_one}: should_generate={should_generate}, is_main_process={accelerator.is_main_process}"
@@ -1133,6 +1504,10 @@ def main():
                             mlflow_run_id=mlflow_run_id,
                         )
 
+                        import gc
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
                         # if not config.model.showo.get("w_clip_vit", False):
                         #     evaluate_mmu(
                         #         model,
@@ -1146,7 +1521,7 @@ def main():
                         #         mlflow_run_id=mlflow_run_id,
                         #     )
 
-                    should_eval_metrics = (step_plus_one % metric_interval == 0)
+                    should_eval_metrics = (global_step % metric_interval == 0)
                     
                     if should_eval_metrics:
                         if accelerator.is_main_process:
@@ -1156,10 +1531,15 @@ def main():
                         rank = accelerator.process_index
                         world_size = accelerator.num_processes
                     
-                        unwrapped_model = accelerator.unwrap_model(model).to(device)
+                        # Переводим модель в eval mode для бенчмарка
+                        model.eval()
+                        unwrapped_model = accelerator.unwrap_model(model)
                         mask_token_id = unwrapped_model.config.mask_token_id
                         
-
+                        # Весь бенчмарк в no_grad для экономии памяти
+                        with torch.no_grad():
+                            # Бенчмарк только на rank 0 (torch_fidelity не поддерживает distributed)
+                            if accelerator.is_main_process:
                         benchmark = ShowoBenchmark(
                             config=config,
                             coco_dataset=coco_eval_dataset,
@@ -1170,42 +1550,39 @@ def main():
                             save_comparisons=False,
                         )
                         
-                        subset_size = config.evaluation.coco.get('subset_size', 100)
-                        seed = config.evaluation.coco.get('seed', 42)
+                        subset_size = config.evaluation.coco['subset_size']
+                        seed = config.evaluation.coco['seed']
                         
-                        # Создаем индексы и делим их между процессами
-                        import random
-                        rng = random.Random(seed)
-                        all_indices = list(range(len(coco_eval_dataset)))
-                        rng.shuffle(all_indices)
-                        subset_indices = all_indices[:subset_size]
-                        
-                        indices_per_process = len(subset_indices) // world_size
-                        start_idx = rank * indices_per_process
-                        end_idx = start_idx + indices_per_process if rank < world_size - 1 else len(subset_indices)
-                        my_indices = subset_indices[start_idx:end_idx]
-                        
-                        if accelerator.is_main_process:
-                            print(f'Total samples: {len(subset_indices)}, per process: ~{indices_per_process}')
-                        
-                        benchmark._evaluate_indices(my_indices, skip_compute=True)
-                        
-                        accelerator.wait_for_everyone()
+                                print(f'Starting FID benchmark with {subset_size} samples...')
+                                fid_score = benchmark.run_subset(subset_size=subset_size, seed=seed)
 
-                        if accelerator.is_main_process:
-                            fid_score = benchmark.fid_metric.compute()
-                            print(f'Benchmark finished, FID: {fid_score.item()}')
+                                if fid_score is not None:
+                                    print(f'Benchmark finished, FID: {fid_score:.4f}')
                             mlflow_client.log_metric(
                                 mlflow_run_id,
                                 "metrics/fid_coco",
-                                fid_score.item(),
+                                        fid_score,
                                 step=step_plus_one,
                             )
-                        
-                        benchmark.fid_metric.reset()
-                        
+                                else:
+                                    print('Benchmark returned None (skip_compute=True?)')
+                                
+                                # Очистка памяти
+                                benchmark.model = None
+                                benchmark.vq_model = None
+                                benchmark.tokenizer = None
+                                benchmark.uni_prompting = None
                         del benchmark
+                            
+                            accelerator.wait_for_everyone()
+                        
+                        # Возвращаем модель в train mode
+                        model.train()
+                        
+                        import gc
+                        gc.collect()
                         torch.cuda.empty_cache()
+                        torch.cuda.ipc_collect()
                     
                     # Wait for all processes to finish benchmark
                     accelerator.wait_for_everyone()

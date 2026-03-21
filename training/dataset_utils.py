@@ -141,81 +141,91 @@ def create_dataloaders(
     # ============================================================
     # Data for image captioning / multimodal understanding (MMU)
     # ============================================================
+    batch_size_mmu = config.training.get("batch_size_mmu", 0)
     total_batch_size_mmu_without_accum = (
-        config.training.batch_size_mmu * accelerator.num_processes
+        batch_size_mmu * accelerator.num_processes
     )
 
-    if config.dataset.und_type == "captioning":
-        dataset_mmu = Text2ImageDataset(
-            train_shards_path_or_url=dataset_config.train_mmu_shards_path_or_url,
-            tokenizer=None,  # we want to get raw texts
-            max_seq_length=preproc_config.max_seq_length,
-            num_train_examples=config.experiment.max_train_examples_mmu,
-            per_gpu_batch_size=config.training.batch_size_mmu,
-            global_batch_size=total_batch_size_mmu_without_accum,
-            num_workers=dataset_config.num_workers,
-            resolution=preproc_config.resolution,
-            shuffle_buffer_size=dataset_config.shuffle_buffer_size,
-            pin_memory=dataset_config.pin_memory,
-            persistent_workers=dataset_config.persistent_workers,
-            external_caption_path=dataset_config.external_caption_path,
-            external_journeydb_caption_path=dataset_config.external_journeydb_caption_path,
-            external_laion12m_caption_path=dataset_config.external_laion12m_caption_path,
-            external_cc12m_caption_path=dataset_config.external_cc12m_caption_path,
-            is_captioning=True,
-            add_caption_prompt=dataset_config.add_caption_prompt,
-        )
-        train_dataloader_mmu = dataset_mmu.train_dataloader
+    # Инициализируем train_dataloader_mmu как None
+    train_dataloader_mmu = None
 
-    elif config.dataset.und_type == "captioning_parquet":
-        if create_imagetext_dataloader is None:
-            raise ValueError(
-                "create_imagetext_dataloader function is required for captioning_parquet mode"
+    # Создаем MMU dataloader только если batch_size_mmu > 0
+    if batch_size_mmu > 0:
+        if config.dataset.und_type == "captioning":
+            dataset_mmu = Text2ImageDataset(
+                train_shards_path_or_url=dataset_config.train_mmu_shards_path_or_url,
+                tokenizer=None,  # we want to get raw texts
+                max_seq_length=preproc_config.max_seq_length,
+                num_train_examples=config.experiment.max_train_examples_mmu,
+                per_gpu_batch_size=config.training.batch_size_mmu,
+                global_batch_size=total_batch_size_mmu_without_accum,
+                num_workers=dataset_config.num_workers,
+                resolution=preproc_config.resolution,
+                shuffle_buffer_size=dataset_config.shuffle_buffer_size,
+                pin_memory=dataset_config.pin_memory,
+                persistent_workers=dataset_config.persistent_workers,
+                external_caption_path=dataset_config.external_caption_path,
+                external_journeydb_caption_path=dataset_config.external_journeydb_caption_path,
+                external_laion12m_caption_path=dataset_config.external_laion12m_caption_path,
+                external_cc12m_caption_path=dataset_config.external_cc12m_caption_path,
+                is_captioning=True,
+                add_caption_prompt=dataset_config.add_caption_prompt,
+            )
+            train_dataloader_mmu = dataset_mmu.train_dataloader
+
+        elif config.dataset.und_type == "captioning_parquet":
+            if create_imagetext_dataloader is None:
+                raise ValueError(
+                    "create_imagetext_dataloader function is required for captioning_parquet mode"
+                )
+
+            train_dataloader_mmu = create_imagetext_dataloader(
+                train_shards_path_or_url=dataset_config.train_mmu_shards_path_or_url,
+                batch_size=batch_size_mmu,
+                image_size=preproc_config.resolution,
+                num_workers=dataset_config.num_workers,
+                num_readers=32,
+                predefined_steps=num_update_steps_per_epoch,
+                drop_last=True,
+                shuffle=True,
+                shuffle_buffer_size=dataset_config.shuffle_buffer_size,
+                is_captioning=True,
             )
 
-        train_dataloader_mmu = create_imagetext_dataloader(
-            train_shards_path_or_url=dataset_config.train_mmu_shards_path_or_url,
-            batch_size=config.training.batch_size_mmu,
-            image_size=preproc_config.resolution,
-            num_workers=dataset_config.num_workers,
-            num_readers=32,
-            predefined_steps=num_update_steps_per_epoch,
-            drop_last=True,
-            shuffle=True,
-            shuffle_buffer_size=dataset_config.shuffle_buffer_size,
-            is_captioning=True,
-        )
+        elif config.dataset.und_type == "llava_pretrain":
+            train_dataloader_mmu = get_instruct_data_loader(
+                tokenizer,
+                batch_size=batch_size_mmu,
+                num_workers=dataset_config.num_workers,
+                world_size=accelerator.num_processes,
+                local_rank=accelerator.process_index,
+                max_length=preproc_config.max_seq_length
+                if config.dataset.add_system_prompt
+                else preproc_config.max_seq_length + SYSTEM_PROMPT_LEN,
+                phase="pretrain",
+            )
 
-    elif config.dataset.und_type == "llava_pretrain":
-        train_dataloader_mmu = get_instruct_data_loader(
-            tokenizer,
-            batch_size=config.training.batch_size_mmu,
-            num_workers=dataset_config.num_workers,
-            world_size=accelerator.num_processes,
-            local_rank=accelerator.process_index,
-            max_length=preproc_config.max_seq_length
-            if config.dataset.add_system_prompt
-            else preproc_config.max_seq_length + SYSTEM_PROMPT_LEN,
-            phase="pretrain",
-        )
+        elif config.dataset.und_type == "llava_tuning":
+            train_dataloader_mmu = get_instruct_data_loader(
+                tokenizer,
+                batch_size=batch_size_mmu,
+                num_workers=dataset_config.num_workers,
+                world_size=accelerator.num_processes,
+                local_rank=accelerator.process_index,
+                max_length=preproc_config.max_seq_length
+                if config.dataset.add_system_prompt
+                else preproc_config.max_seq_length + SYSTEM_PROMPT_LEN,
+                phase="tuning",
+            )
 
-    elif config.dataset.und_type == "llava_tuning":
-        train_dataloader_mmu = get_instruct_data_loader(
-            tokenizer,
-            batch_size=config.training.batch_size_mmu,
-            num_workers=dataset_config.num_workers,
-            world_size=accelerator.num_processes,
-            local_rank=accelerator.process_index,
-            max_length=preproc_config.max_seq_length
-            if config.dataset.add_system_prompt
-            else preproc_config.max_seq_length + SYSTEM_PROMPT_LEN,
-            phase="tuning",
-        )
+        # Если und_type не распознан - ошибка
+        else:
+            raise NotImplementedError(
+                f"Unsupported dataset und_type: {config.dataset.und_type}"
+            )
 
-    else:
-        raise NotImplementedError(
-            f"Unsupported dataset und_type: {config.dataset.und_type}"
-        )
+    # Если batch_size_mmu = 0, train_dataloader_mmu остается None
+    # и не будет добавлен в iterables ниже
 
     # ============================================================
     # Domain-specific datasets (VQAv2, TextVQA, DocVQA, Kvasir-VQA, TextVQA Experiments, VQAv2 Experiments)
@@ -230,7 +240,7 @@ def create_dataloaders(
     # VQAv2
     train_dataloader_vqav2 = None
     if hasattr(dataset_config, 'vqav2_data_file_path') and dataset_config.vqav2_data_file_path:
-        batch_size_vqav2 = config.training.batch_size_vqav2 if hasattr(config.training, 'batch_size_vqav2') else config.training.batch_size_mmu
+        batch_size_vqav2 = config.training.batch_size_vqav2 if hasattr(config.training, 'batch_size_vqav2') else batch_size_mmu
         if batch_size_vqav2 > 0 and os.path.exists(dataset_config.vqav2_data_file_path):
             train_dataloader_vqav2 = get_domain_data_loader(
                 tokenizer,
@@ -251,7 +261,7 @@ def create_dataloaders(
     # TextVQA
     train_dataloader_textvqa = None
     if hasattr(dataset_config, 'textvqa_data_file_path') and dataset_config.textvqa_data_file_path:
-        batch_size_textvqa = config.training.batch_size_textvqa if hasattr(config.training, 'batch_size_textvqa') else config.training.batch_size_mmu
+        batch_size_textvqa = config.training.batch_size_textvqa if hasattr(config.training, 'batch_size_textvqa') else batch_size_mmu
         if batch_size_textvqa > 0 and os.path.exists(dataset_config.textvqa_data_file_path):
             train_dataloader_textvqa = get_domain_data_loader(
                 tokenizer,
@@ -272,7 +282,7 @@ def create_dataloaders(
     # TextVQA Experiments (датасет для экспериментов MoE - 1000 семплов)
     train_dataloader_textvqa_experiments = None
     if hasattr(dataset_config, 'textvqa_experiments_data_file_path') and dataset_config.textvqa_experiments_data_file_path:
-        batch_size_textvqa_experiments = config.training.batch_size_textvqa_experiments if hasattr(config.training, 'batch_size_textvqa_experiments') else config.training.batch_size_mmu
+        batch_size_textvqa_experiments = config.training.batch_size_textvqa_experiments if hasattr(config.training, 'batch_size_textvqa_experiments') else batch_size_mmu
         if batch_size_textvqa_experiments > 0 and os.path.exists(dataset_config.textvqa_experiments_data_file_path):
             train_dataloader_textvqa_experiments = get_domain_data_loader(
                 tokenizer,
@@ -293,7 +303,7 @@ def create_dataloaders(
     # VQAv2 Experiments (датасет для экспериментов MoE - 1000 семплов)
     train_dataloader_vqav2_experiments = None
     if hasattr(dataset_config, 'vqav2_experiments_data_file_path') and dataset_config.vqav2_experiments_data_file_path:
-        batch_size_vqav2_experiments = config.training.batch_size_vqav2_experiments if hasattr(config.training, 'batch_size_vqav2_experiments') else config.training.batch_size_mmu
+        batch_size_vqav2_experiments = config.training.batch_size_vqav2_experiments if hasattr(config.training, 'batch_size_vqav2_experiments') else batch_size_mmu
         if batch_size_vqav2_experiments > 0 and os.path.exists(dataset_config.vqav2_experiments_data_file_path):
             train_dataloader_vqav2_experiments = get_domain_data_loader(
                 tokenizer,
@@ -314,7 +324,7 @@ def create_dataloaders(
     # DocVQA
     train_dataloader_docvqa = None
     if hasattr(dataset_config, 'docvqa_data_file_path') and dataset_config.docvqa_data_file_path:
-        batch_size_docvqa = config.training.batch_size_docvqa if hasattr(config.training, 'batch_size_docvqa') else config.training.batch_size_mmu
+        batch_size_docvqa = config.training.batch_size_docvqa if hasattr(config.training, 'batch_size_docvqa') else batch_size_mmu
         if batch_size_docvqa > 0 and os.path.exists(dataset_config.docvqa_data_file_path):
             train_dataloader_docvqa = get_domain_data_loader(
                 tokenizer,
@@ -335,7 +345,7 @@ def create_dataloaders(
     # Kvasir-VQA
     train_dataloader_kvasir = None
     if hasattr(dataset_config, 'kvasir_data_file_path') and dataset_config.kvasir_data_file_path:
-        batch_size_kvasir = config.training.batch_size_kvasir if hasattr(config.training, 'batch_size_kvasir') else config.training.batch_size_mmu
+        batch_size_kvasir = config.training.batch_size_kvasir if hasattr(config.training, 'batch_size_kvasir') else batch_size_mmu
         if batch_size_kvasir > 0 and os.path.exists(dataset_config.kvasir_data_file_path):
             train_dataloader_kvasir = get_domain_data_loader(
                 tokenizer,
@@ -356,7 +366,7 @@ def create_dataloaders(
     # CLEVR
     train_dataloader_clevr = None
     if hasattr(dataset_config, 'clevr_data_file_path') and dataset_config.clevr_data_file_path:
-        batch_size_clevr = config.training.batch_size_clevr if hasattr(config.training, 'batch_size_clevr') else config.training.batch_size_mmu
+        batch_size_clevr = config.training.batch_size_clevr if hasattr(config.training, 'batch_size_clevr') else batch_size_mmu
         if batch_size_clevr > 0 and os.path.exists(dataset_config.clevr_data_file_path):
             train_dataloader_clevr = get_domain_data_loader(
                 tokenizer,
@@ -377,21 +387,24 @@ def create_dataloaders(
     # ============================================================
     # Dummy LM dataloader
     # ============================================================
-    train_dataloader_lm = torch.utils.data.DataLoader(
-        DummyLMDataset(),
-        batch_size=config.training.batch_size_lm,
-        sampler=None,
-        collate_fn=DummyLMDataset().collate_fn,
-    )
+    # batch_size_lm = config.training.get("batch_size_lm", 0)
+    # train_dataloader_lm = torch.utils.data.DataLoader(
+    #     DummyLMDataset(),
+    #     batch_size=batch_size_lm,
+    #     sampler=None,
+    #     collate_fn=DummyLMDataset().collate_fn,
+    # )
 
     # ============================================================
     # Combined dataloader
     # ============================================================
     iterables = {
         "t2i_flow": train_dataloader_t2i,
-        "lm_flow": train_dataloader_lm,
-        "mmu_flow": train_dataloader_mmu,
+        # "lm_flow": train_dataloader_lm,
     }
+    # Добавляем MMU dataloader только если batch_size_mmu > 0
+    if batch_size_mmu > 0:
+        iterables["mmu_flow"] = train_dataloader_mmu
     
     # Добавляем доменные датасеты в iterables, если они доступны и включены через флаги
     # Каждый датасет управляется отдельным флагом в конфиге

@@ -4,62 +4,68 @@ mlflow:
     experiment_name: "moe-training"
     tags:
         model: "show-o"
-        task: "mmu"
+        task: "unified"
         moe_experts: "8"
+
+sample_logging:
+    enabled: true
+    log_every_n_steps: 100      # Логировать семплы каждые N глобальных шагов
+    max_samples_per_step: 2     # Максимум семплов на тип задачи за шаг
 
 mode: "t2i"
 
 experiment:
     project: "moe-training"
-    name: "showo-vanilla-mmu"
-    output_dir: "output/showo-vanilla-mmu"
-    max_train_examples_t2i: 20000000
-    max_train_examples_mmu: 40000000
-    save_every: 3000
+    name: "showo-moe-unified-v2"
+    output_dir: "output/showo-moe-unified-v2"
+    max_train_examples_t2i: 10000000   # ~1M CC12M * 10 эпох
+    max_train_examples_mmu: 5000000    # MMU данные
+    save_every: 5000
     eval_every: 2500
     generate_every: 500
-    log_every: 50
+    log_every: 100
     log_grad_norm_every: 500
     resume_from_checkpoint: false
 
 evaluation:
-    metric_interval: 200
+    metric_interval: 500
     coco:
         enabled: true
         images_root: "/home/jovyan/vasiliev/notebooks/Show-o/train2017"
         ann_file: "/home/jovyan/vasiliev/notebooks/Show-o/annotations/captions_train2017.json"
-        subset_size: 100 
-        batch_size: 4
+        subset_size: 500
+        batch_size: 2
         seed: 42
     mmu:
         enabled: true
         dataset_type: "mmmu"
-        subset_size: 100
-        batch_size: 4
+        subset_size: 400
+        batch_size: 2
         seed: 42
 
 moe:
-    enabled: true
+    enabled: false  # ⚠️ ТЕСТ: отключаем MoE чтобы посмотреть baseline loss
     num_experts: 8
     top_k: 2
     count_layers_to_patch: 6
-    freeze_base_model: false   # ❗ Размораживаем - модель должна адаптироваться к MoE!
+    freeze_base_model: false
     save_only_moe_weights: false
     learning_rate: null  
     activation_stats:
         collect_frequency: 5
 
-    temp_fixed: null           # Фиксированная температура 1.0 (стабильная)
-    temp_start: 20.0
-    temp_end: 1.0
-    temp_steps: 1000
-    balance_warmup_steps: 500
+    # Температурное расписание для gate - начинаем с высокой для exploration
+    temp_fixed: null
+    temp_start: 10.0           # Уменьшено с 20.0
+    temp_end: 0.1
+    temp_steps: 1000           # Увеличено с 1000 - медленнее охлаждаем
+    balance_warmup_steps: 400 # Увеличено с 500
     balance_gamma: 0.999
     
-    use_modality_bias: false   # Отключаем на первом этапе
+    use_modality_bias: false
     use_domain_bias: false
-    modality_init_hardness: 0.0
-    modality_init_steps: 1
+    modality_init_hardness: 30.0   # Уменьшено с 50.0
+    modality_init_steps: 2000      # Увеличено с 1000
     modality_init_hardness_min: 0.0
     domain_init_hardness: 0.0
     domain_init_steps: 1
@@ -68,10 +74,10 @@ moe:
         vqav2_experiments: [0, 1, 2, 3, 4]
         textvqa_experiments: [3, 4, 5, 6, 7]
     use_gumbel: false
-    gate_capacity: [2.0, 4.0]  # Увеличенный capacity (меньше pruning)
-    random_routing: false      # Отключаем
+    gate_capacity: [2.0, 4.0]  # Увеличенный capacity
+    random_routing: false      # ВАЖНО: отключаем на начальном этапе
 
-    noise_std: 0.0            # ❗ БЕЗ шума - эксперты = точные копии MLP
+    noise_std: 0.01
     log_gates: True
     log_activations: True
     log_frequency: 50
@@ -84,23 +90,24 @@ model:
 
     showo:
         load_from_showo: True
-        pretrained_model_path: "showlab/show-o-w-clip-vit"
+        pretrained_model_path: "showlab/show-o-w-clip-vit-512x512"
         w_clip_vit: True
         vocab_size: 58498
         llm_vocab_size: 50295
-        llm_model_path: "microsoft/phi-1_5"
+        llm_model_path: 'microsoft/phi-1_5'
         codebook_size: 8192
-        num_vq_tokens: 256
+        num_vq_tokens: 1024
         num_new_special_tokens: 10
 
     gradient_checkpointing: True
 
 dataset:
-    gen_type: "imagenet1k"
-    und_type: "llava_pretrain"
+    gen_type: "t2i"
+    und_type: "captioning"      # Используем captioning как в оригинале
     combined_loader_mode: "max_size_cycle"
     add_system_prompt: False
 
+    # Доменные датасеты - можно включить позже для MoE экспериментов
     use_vqav2: false
     use_textvqa: false
     use_textvqa_experiments: false  
@@ -108,12 +115,30 @@ dataset:
     use_clevr: false
     use_docvqa: false
     use_kvasir: false
+    
     params:
-        train_t2i_shards_path_or_url: "/home/jovyan/vasiliev/notebooks/Show-o/data/llava_pretrain/images"
+        batch_size: ${training.batch_size}
+        # T2I данные - CC12M (~2M) + LAION-Aesthetics (пока 10k, докачивается до 100k)
+        train_t2i_shards_path_or_url:
+          - "/home/jovyan/vasiliev/notebooks/Show-o/data/cc12m/cc12m-train-{0000..0200}.tar"
+          - "/home/jovyan/vasiliev/notebooks/Show-o/data/laion10k/laion10k-{00000..00049}.tar"
+        
+        # MMU данные - те же датасеты для captioning
+        train_mmu_shards_path_or_url:
+          - "/home/jovyan/vasiliev/notebooks/Show-o/data/cc12m/cc12m-train-{0000..0200}.tar"
+          - "/home/jovyan/vasiliev/notebooks/Show-o/data/laion10k/laion10k-{00000..00049}.tar"
+        
+        # LM данные - пока отключаем, т.к. нет RefinedWeb
         train_lm_shards_path_or_url: "/home/jovyan/vasiliev/notebooks/Show-o/data/llava_pretrain"
+        add_caption_prompt: true    # ВАЖНО: включаем caption prompt как в оригинале
+        external_caption_path: ""
+        external_journeydb_caption_path: ""
+        external_laion12m_caption_path: ""
+        external_cc12m_caption_path: ""
         validation_prompts_file: "validation_prompts/text2image_prompts.txt"
-        num_workers: 8
-        shuffle_buffer_size: 1000
+        num_workers: 16             # Уменьшено с 32 для стабильности
+        resolution: 512
+        shuffle_buffer_size: 1000  # ВАЖНО: было 1, референс использует 1000
         pin_memory: True
         persistent_workers: True
 
@@ -137,58 +162,55 @@ dataset:
         kvasir_data_file_path: "/home/jovyan/vasiliev/notebooks/Show-o/data/kvasir/train.json"
         kvasir_image_root: "/home/jovyan/vasiliev/notebooks/Show-o/data/kvasir/images"
     preprocessing:
-        max_seq_length: 256
-        resolution: 256
+        max_seq_length: 128
+        resolution: 512
+        center_crop: False
+        random_flip: False
 
 optimizer:
     name: adamw
     params:
-        learning_rate: 0.00005     # Базовая модель fine-tune
-        moe_learning_rate: 0.0002  # Gate учится быстрее (случайно инициализирован)
+        learning_rate: 0.0
+        moe_learning_rate: 5e-5
         scale_lr: False
         beta1: 0.9
         beta2: 0.999
-        weight_decay: 0.01        # Уменьшенная регуляризация
+        weight_decay: 0.01
         epsilon: 1e-8
 
 lr_scheduler:
     scheduler: "cosine"
     params:
         learning_rate: ${optimizer.params.learning_rate}
-        warmup_steps: 1000
+        warmup_steps: 100
 
 training:
-    gradient_accumulation_steps: 1
+    gradient_accumulation_steps: 48  # Увеличено для компенсации меньшего batch
     noise_type: "mask"
 
-    batch_size: ${.batch_size_t2i}
-    batch_size_t2i: 2
-    batch_size_lm: 1
-    batch_size_mmu: 2
-    batch_size_vqav2: 2
-    batch_size_vqav2_experiments: 2
-    batch_size_textvqa: 2
-    batch_size_textvqa_experiments: 2
-    batch_size_clevr: 2
-    batch_size_docvqa: 2
-    batch_size_kvasir: 2
+    batch_size: 2              # Уменьшено для экономии памяти (OOM fix с max_seq_length=512)
+    batch_size_t2i: 1                # Уменьшено (OOM fix)
+    batch_size_lm: 0                 # Пока 0 - нет RefinedWeb данных
+    batch_size_mmu: 1                # MMU включён
 
     mixed_precision: "bf16"
     enable_tf32: True
     seed: 10086
     max_train_steps: 100000
     overfit_one_batch: False
-    cond_dropout_prob: 0.1
+    cond_dropout_prob: 0.1          # CFG dropout как в оригинале
     min_masking_rate: 0.0
     label_smoothing: 0.0
     max_grad_norm: 1.0
-    guidance_scale: 3.0
+    guidance_scale: 3.0            # Возвращаем нормальное значение (было 0.0 - это убивает качество)
     generation_timesteps: 18
-    t2i_coeff: 1.0
-    lm_coeff: 0.0
-    mmu_coeff: 1.0
-    orthogonal_coeff: 0.00
-
-    balance_coeff: 0.01  # Увеличили (т.к. уменьшили множитель в loss)
     
-    profiler_enabled: True
+    # ВАЖНО: Коэффициенты для multi-task learning
+    t2i_coeff: 1.0                  # T2I loss веса
+    lm_coeff: 0.0                   # LM отключён (нет данных)
+    mmu_coeff: 1.0                  # ⬆️ MMU включён!
+    
+    orthogonal_coeff: 0.0
+    balance_coeff: 0.01
+    
+    profiler_enabled: False         # Отключаем профайлер для скорости

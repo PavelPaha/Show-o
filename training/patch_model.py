@@ -31,13 +31,22 @@ def patch_model_with_moe(
     num_experts = moe_config["num_experts"]   
     moe_exists = False 
     
-    # ШАГ 1: Замораживаем ВСЮ базовую модель если нужно
+    # ШАГ 1: Замораживаем или размораживаем базовую модель
     if freeze_base:
         frozen_count = 0
         for name, param in model.named_parameters():
             param.requires_grad = False
             frozen_count += 1
         print(f"   ❄️  Заморожено {frozen_count} параметров базовой модели")
+    else:
+        # Явно размораживаем базовые параметры (кроме MoE, которые будут обработаны позже)
+        unfrozen_count = 0
+        for name, param in model.named_parameters():
+            # Пропускаем MoE параметры - они будут обработаны в ШАГ 3
+            if not any(x in name for x in ["mlp.experts", "mlp.gate", "mlp.alpha"]):
+                param.requires_grad = True
+                unfrozen_count += 1
+        print(f"   🔥 Разморожено {unfrozen_count} параметров базовой модели")
     
     # ШАГ 2: Патчим MLP слои на MoE
     layers_to_patch = count_layers_to_patch
@@ -82,9 +91,22 @@ def patch_model_with_moe(
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     
+    # Проверка: считаем параметры по категориям
+    base_trainable = sum(p.numel() for name, p in model.named_parameters() 
+                        if p.requires_grad and not any(x in name for x in ["mlp.experts", "mlp.gate", "mlp.alpha"]))
+    moe_trainable = sum(p.numel() for name, p in model.named_parameters() 
+                       if p.requires_grad and any(x in name for x in ["mlp.experts", "mlp.gate", "mlp.alpha"]))
+    
     print(f"✓ Заменено слоев: {len(patched_layers)} из {total_layers} ({100*len(patched_layers)/total_layers:.1f}%)")
     print(f"✓ Слои с MoE: {patched_layers}")
     print(f"✓ Слои с оригинальным FFN: {[i for i in range(total_layers) if i not in patched_layers]}")
     print(f"✓ Обучаемых параметров: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
+    print(f"   - Базовые параметры: {base_trainable:,} {'✅ разморожены' if base_trainable > 0 and not freeze_base else '❄️ заморожены'}")
+    print(f"   - MoE параметры: {moe_trainable:,} ✅ разморожены")
+    
+    # Валидация: если freeze_base=False, должны быть разморожены базовые параметры
+    if not freeze_base and base_trainable == 0:
+        print(f"⚠️  ВНИМАНИЕ: freeze_base_model=False, но базовые параметры не разморожены!")
+        print(f"   Проверьте, что модель загружена с правильными настройками.")
     
     return model

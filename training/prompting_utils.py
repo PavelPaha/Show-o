@@ -66,7 +66,6 @@ class UniversalPrompting():
 
             # prompting -- [task token] [sot] [text tokens] [eot] [soi] [image tokens] [eoi]
             temp_label_ids = torch.cat([
-                # should we predict text tokens when doing image reconstruction?
                 torch.tensor(temp_ids).to(device),
                 self.sptids_dict['<|soi|>'].to(device),
                 labels[i],
@@ -240,9 +239,8 @@ class UniversalPrompting():
                 temp_ids = temp_ids[:self.max_text_len - 1] + [self.text_tokenizer.eos_token_id]
                 temp_masks = [1] * (len(temp_ids) + image_ids.shape[-1] + 3)  # +2 for two special tokens
 
-            # prompting -- [task token] [sot] [text tokens] [eot] [soi] [image tokens] [eoi]
+            # prompting -- [task token] [sot] [text tokens] [eot] [sov] [video tokens] [eov]
             temp_label_ids = torch.cat([
-                # should we predict text tokens when doing image reconstruction?
                 torch.tensor(temp_ids).to(device),
                 self.sptids_dict['<|sov|>'].to(device),
                 labels[i],
@@ -338,7 +336,6 @@ class UniversalPrompting():
 
             # prompting -- [task token] [sot] [text tokens] [eot] [soi] [image tokens] [eoi]
             temp_label_ids = torch.cat([
-                # should we predict text tokens when doing image reconstruction?
                 torch.tensor(temp_ids).to(device),
                 self.sptids_dict['<|soi|>'].to(device),
                 labels[i],

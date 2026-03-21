@@ -1,6 +1,5 @@
 from typing import Dict
 import torch
-from copy import deepcopy
 from collections import defaultdict
 
 class LayerExpertStatsCollector:
@@ -8,32 +7,29 @@ class LayerExpertStatsCollector:
         self.model = unwrapped_model
 
     def collect(self, global_step) -> Dict[str, Dict[int, Dict[int, int]]]:
-        layer_expert_counts: Dict[str, Dict[int, Dict[int, int]]] =  defaultdict(dict)
+        layer_expert_counts: Dict[str, Dict[int, Dict[int, int]]] = defaultdict(dict)
         modality_layer_probs: Dict[str, Dict[int, torch.Tensor]] = defaultdict(dict)
 
         for layer_idx, layer in enumerate(self.model.showo.model.layers):
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
-                distr_hist = deepcopy(layer.mlp._gate_distribution_history)
-                prob_history = deepcopy(layer.mlp._gate_probability_history)
-                
-                print(f'Modalities: {list(prob_history.keys())}')
+                # Получаем ссылки на историю без deepcopy (экономим память)
+                distr_hist = layer.mlp._gate_distribution_history
+                prob_history = layer.mlp._gate_probability_history
 
                 for modality, history in prob_history.items():
                     probs = history.get(global_step)
-                    modality_layer_probs[modality][layer_idx] = probs.detach().cpu()
-                print(f'{distr_hist=}')
-                print(f'{prob_history=}')
+                    if probs is not None:
+                        modality_layer_probs[modality][layer_idx] = probs.detach().cpu()
 
                 for modality, history in distr_hist.items():
                     if modality not in layer_expert_counts:
                         layer_expert_counts[modality] = {}
 
-                    # Берем только данные текущего шага, а не суммируем все шаги
+                    # Берем только данные текущего шага
                     step_counts = history.get(global_step)
                     if step_counts is not None and isinstance(step_counts, dict):
                         layer_expert_counts[modality][layer_idx] = step_counts.copy()
                     else:
-                        # Если данных для текущего шага нет, используем пустой словарь
                         layer_expert_counts[modality][layer_idx] = {}
 
         return layer_expert_counts, modality_layer_probs

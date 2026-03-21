@@ -83,3 +83,15 @@ wandb/
 show-o-demo/*
 
 uv.lock
+
+train2017
+train2017/*
+
+benchmark/*
+
+show-o-demo-default/*
+
+*.json
+gate_distributions/
+
+*.zip

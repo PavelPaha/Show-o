@@ -1,0 +1,4 @@
+#!/bin/bash
+echo "nvcc: NVIDIA (fake) Cuda compiler"
+echo "Cuda compilation tools, release 99.99, V99.99"
+exit 0

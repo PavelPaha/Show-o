@@ -56,29 +56,22 @@ def flatten_omega_conf(cfg: Any, resolve: bool = False) -> List[Tuple[str, Any]]
     return ret
 
 
-def log_images_to_mlflow(
-    pil_images, filenames, artifact_path, mlflow_client=None, mlflow_run_id=None
+def log_images_to_comet(
+    pil_images, filenames, artifact_path, comet_experiment=None
 ):
+    if comet_experiment is None:
+        return
+
     temp_dir = tempfile.mkdtemp()
-
-    for image, filename in zip(pil_images, filenames):
-        image_path = os.path.join(temp_dir, filename)
-        image.save(image_path)
-
-        if mlflow_client is not None and mlflow_run_id is not None:
-            client = mlflow_client
-            run_id = mlflow_run_id
-        else:
-            import mlflow
-
-            run_id = mlflow.active_run().info.run_id if mlflow.active_run() else None
-            if run_id is None:
-                continue
-            client = MlflowClient()
-
-        client.log_artifact(run_id, image_path, artifact_path)
-
-    shutil.rmtree(temp_dir)
+    try:
+        for image, filename in zip(pil_images, filenames):
+            image_path = os.path.join(temp_dir, filename)
+            image.save(image_path)
+            comet_experiment.log_image(
+                image_path, name=f"{artifact_path}/{filename}"
+            )
+    finally:
+        shutil.rmtree(temp_dir)
 
 
 ##################################################

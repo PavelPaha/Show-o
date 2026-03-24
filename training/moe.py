@@ -43,7 +43,7 @@ class MoE(nn.Module):
         config: PhiConfig,
         moe_config,
         template_mlp: Optional[nn.Module] = None,
-        mlflow_logger = None,
+        comet_logger = None,
         visualizer = None,
         layer_idx = None,
         special_tokens = None,
@@ -146,7 +146,7 @@ class MoE(nn.Module):
         self._probability_counts = defaultdict(dict)
         self._last_overall_logged_step = -1
         self._domain_last_logged_step = {}
-        self._mlflow_logger = mlflow_logger
+        self._comet_logger = comet_logger
         self._visualizer : MoEVisualizer = visualizer
 
         self._log_gates = log_gates
@@ -369,16 +369,14 @@ class MoE(nn.Module):
                     )
 
                     if emit_overall:
-                        self._log_to_mlflow_modality_gates(
+                        self._log_modality_gate_stats(
                             modality_expert_counts, modality_total, modality_gate_score, modality_name
                         )
 
             if total_activations > 0 and emit_overall:
-                self._log_to_mlflow_gates(expert_counts, total_activations, gate_score)
+                self._log_gate_stats(expert_counts, total_activations, gate_score)
 
         # Process per-domain statistics from sample_domains
-        # Простая логика: для каждого уникального домена в sample_domains собираем статистику
-        # ВАЖНО: делаем это ДО вызова _log_all_plots_to_mlflow, чтобы домены были в history
         if token_domains_flat is not None and len(token_domains_flat) > 0:
             unique_domains = set(d for d in token_domains_flat if d is not None)
             # if self._global_step <= 2:
@@ -430,12 +428,11 @@ class MoE(nn.Module):
                         finalize=True,
                     )
                     self._save_distribution_to_json(domain_expert_counts, domain_key_str)
-                    self._log_to_mlflow_gates(domain_expert_counts, sum(domain_expert_counts.values()), domain_gate_score)
+                    self._log_gate_stats(domain_expert_counts, sum(domain_expert_counts.values()), domain_gate_score)
                     self._domain_last_logged_step[domain_key_str] = self._global_step
 
-        # Теперь вызываем _log_all_plots_to_mlflow ПОСЛЕ обработки всех доменов
         if accumulate_overall and emit_overall:
-            self._log_all_plots_to_mlflow(
+            self._log_all_plots(
                 overall_expert_counts=expert_counts,
                 overall_gate_score=gate_score,
                 text_expert_counts=text_expert_counts,
@@ -445,10 +442,10 @@ class MoE(nn.Module):
             self._last_overall_logged_step = self._global_step
     
     
-    def _log_all_plots_to_mlflow(self, overall_expert_counts, 
+    def _log_all_plots(self, overall_expert_counts, 
                                     overall_gate_score, 
                                     text_expert_counts=None, image_expert_counts=None, domain_id=None):
-        if self._mlflow_logger is None or self._visualizer is None:
+        if self._comet_logger is None or self._visualizer is None:
             return
         
         overall_heatmap_bytes = self._visualizer.create_distribution_heatmap(
@@ -483,7 +480,7 @@ class MoE(nn.Module):
             self._gate_probability_history, self._global_step
         )
         
-        self._mlflow_logger.log_all_plots(
+        self._comet_logger.log_all_plots(
             layer_id=self._layer_id,
             global_step=self._global_step,
             overall_heatmap_bytes=overall_heatmap_bytes,
@@ -653,10 +650,10 @@ class MoE(nn.Module):
         return modality
 
     
-    def _log_to_mlflow_gates(self, expert_counts, total_activations, gate_score):
-        if self._mlflow_logger is None:
+    def _log_gate_stats(self, expert_counts, total_activations, gate_score):
+        if self._comet_logger is None:
             return
-        self._mlflow_logger.log_gate_metrics(
+        self._comet_logger.log_gate_metrics(
             layer_id=self._layer_id,
             global_step=self._global_step,
             expert_counts=expert_counts,
@@ -666,11 +663,11 @@ class MoE(nn.Module):
         )
     
 
-    def _log_to_mlflow_modality_gates(self, expert_counts, total_activations, gate_score, modality_name):
-        if self._mlflow_logger is None:
+    def _log_modality_gate_stats(self, expert_counts, total_activations, gate_score, modality_name):
+        if self._comet_logger is None:
             return
         
-        self._mlflow_logger.log_modality_gate_metrics(
+        self._comet_logger.log_modality_gate_metrics(
             layer_id=self._layer_id,
             global_step=self._global_step,
             expert_counts=expert_counts,
@@ -699,8 +696,8 @@ class MoE(nn.Module):
             json.dump(data, f, indent=2)
     
 
-    def log_distribution_heatmap_to_mlflow(self, modality_name=None, alpha_value=None):
-        if self._mlflow_logger is None or self._visualizer is None:
+    def log_distribution_heatmap(self, modality_name=None, alpha_value=None):
+        if self._comet_logger is None or self._visualizer is None:
             return
         history = self._gate_distribution_history[modality_name]
         heatmap_bytes = self._visualizer.create_distribution_heatmap(
@@ -709,7 +706,7 @@ class MoE(nn.Module):
         if heatmap_bytes is None:
             return
         
-        self._mlflow_logger.log_distribution_heatmap(
+        self._comet_logger.log_distribution_heatmap(
             layer_id=self._layer_id,
             global_step=self._global_step,
             heatmap_bytes=heatmap_bytes,

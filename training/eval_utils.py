@@ -3,7 +3,7 @@ import torch
 from PIL import Image
 from accelerate.logging import get_logger
 from PIL import ImageDraw, ImageFont
-from utils import log_images_to_mlflow
+from utils import log_images_to_comet
 
 from training.prompting_utils import (
     create_attention_mask_predict_next,
@@ -26,19 +26,17 @@ def visualize_predictions(
     ori_images,
     texts,
     logits,
-    mlflow_client=None,
-    mlflow_run_id=None,
+    comet_experiment=None,
 ):
     logger.info("Visualizing predictions...")
     model.eval()
 
-    # Debug prints
-    logger.info(f"🔍 DEBUG - input_ids shape: {input_ids.shape}")
-    logger.info(f"🔍 DEBUG - logits shape: {logits.shape}")
-    logger.info(f"🔍 DEBUG - image_tokens_ori shape: {image_tokens_ori.shape}")
-    logger.info(f"🔍 DEBUG - ori_images shape: {ori_images.shape}")
-    logger.info(f"🔍 DEBUG - batch_size_t2i: {config.training.batch_size_t2i}")
-    logger.info(f"🔍 DEBUG - num_vq_tokens: {config.model.showo.num_vq_tokens}")
+    logger.info(f"DEBUG - input_ids shape: {input_ids.shape}")
+    logger.info(f"DEBUG - logits shape: {logits.shape}")
+    logger.info(f"DEBUG - image_tokens_ori shape: {image_tokens_ori.shape}")
+    logger.info(f"DEBUG - ori_images shape: {ori_images.shape}")
+    logger.info(f"DEBUG - batch_size_t2i: {config.training.batch_size_t2i}")
+    logger.info(f"DEBUG - num_vq_tokens: {config.model.showo.num_vq_tokens}")
 
     recons_images = vq_model.decode_code(
         image_tokens_ori - len(uni_prompting.text_tokenizer)
@@ -46,16 +44,12 @@ def visualize_predictions(
     recons_images = torch.clamp((recons_images + 1.0) / 2.0, min=0.0, max=1.0)
     recons_images *= 255.0
     recons_images = recons_images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
-    logger.info(f"🔍 DEBUG - recons_images shape: {recons_images.shape}")
 
     images = torch.clamp((ori_images + 1.0) / 2.0, min=0.0, max=1.0)
     images *= 255.0
     images = images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
-    logger.info(f"🔍 DEBUG - images shape: {images.shape}")
 
-    # Используем фактическое количество VQ токенов из image_tokens_ori, а не из конфига
     actual_num_vq_tokens = image_tokens_ori.shape[1]
-    logger.info(f"🔍 DEBUG - actual_num_vq_tokens: {actual_num_vq_tokens}")
 
     predictions = logits[
         : config.training.batch_size_t2i,
@@ -63,20 +57,15 @@ def visualize_predictions(
         config.model.showo.llm_vocab_size
         + config.model.showo.num_new_special_tokens : -1,
     ]
-    logger.info(f"🔍 DEBUG - predictions shape before argmax: {predictions.shape}")
     predictions = predictions.argmax(axis=-1)
-    logger.info(f"🔍 DEBUG - predictions shape after argmax: {predictions.shape}")
 
     mask_token_id = (
         config.model.showo.vocab_size - 1 - len(uni_prompting.text_tokenizer)
     )
-    logger.info(f"🔍 DEBUG - mask_token_id: {mask_token_id}")
 
     input_ids = input_ids[
         : config.training.batch_size_t2i, -(actual_num_vq_tokens + 1) : -1 :
     ] - len(uni_prompting.text_tokenizer)
-    logger.info(f"🔍 DEBUG - input_ids (VQ part) shape: {input_ids.shape}")
-    logger.info(f"🔍 DEBUG - input_ids min/max: {input_ids.min()}/{input_ids.max()}")
 
     mask_ratio = list(
         (
@@ -86,43 +75,29 @@ def visualize_predictions(
         .cpu()
         .numpy()
     )
-    logger.info(f"🔍 DEBUG - mask_ratio: {mask_ratio}")
 
     predicted_images = torch.where(input_ids == mask_token_id, predictions, input_ids)
-    logger.info(
-        f"🔍 DEBUG - predicted_images shape before decode: {predicted_images.shape}"
-    )
-    logger.info(
-        f"🔍 DEBUG - predicted_images min/max: {predicted_images.min()}/{predicted_images.max()}"
-    )
-
     predicted_images = vq_model.decode_code(predicted_images)
-    logger.info(
-        f"🔍 DEBUG - predicted_images shape after decode: {predicted_images.shape}"
-    )
-
     predicted_images = torch.clamp((predicted_images + 1.0) / 2.0, min=0.0, max=1.0)
     predicted_images *= 255.0
     predicted_images = (
         predicted_images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
     )
-    logger.info(f"🔍 DEBUG - predicted_images final shape: {predicted_images.shape}")
 
     predicted_images = np.concatenate((images, recons_images, predicted_images), 2)
-    logger.info(f"🔍 DEBUG - concatenated shape: {predicted_images.shape}")
 
     pil_images = [Image.fromarray(image) for image in predicted_images]
 
     filenames = [
         f"prediction_{i}_step_{global_step}.png" for i in range(len(pil_images))
     ]
-    log_images_to_mlflow(
-        pil_images, filenames, "visualizations", mlflow_client, mlflow_run_id
+    log_images_to_comet(
+        pil_images, filenames, "visualizations", comet_experiment
     )
 
     for i, (ratio, text) in enumerate(zip(mask_ratio, texts)):
         logger.info(
-            f"📊 Prediction {i} (mask ratio: {ratio:.2f}, text: {text[:50] if len(text) > 50 else text}...) logged to MLflow"
+            f"Prediction {i} (mask ratio: {ratio:.2f}, text: {text[:50] if len(text) > 50 else text}...) logged to Comet"
         )
 
     model.train()
@@ -137,8 +112,7 @@ def generate_images(
     config,
     global_step,
     mask_schedule,
-    mlflow_client=None,
-    mlflow_run_id=None,
+    comet_experiment=None,
 ):
     logger.info("Generating images...")
     model.eval()
@@ -261,13 +235,11 @@ def generate_images(
     filenames = [
         f"generated_{i}_step_{global_step}.png" for i in range(len(captioned_images))
     ]
-    log_images_to_mlflow(
-        captioned_images, filenames, "generated_images", mlflow_client, mlflow_run_id
+    log_images_to_comet(
+        captioned_images, filenames, "generated_images", comet_experiment
     )
 
-    logger.info(
-        f"🎨 Сгенерированные изображения отправлены в MLflow: generated_images/"
-    )
+    logger.info("Generated images logged to Comet: generated_images/")
 
 
 @torch.no_grad()
@@ -279,8 +251,7 @@ def evaluate_mmu(
     config,
     global_step,
     batch_mmu,
-    mlflow_client=None,
-    mlflow_run_id=None,
+    comet_experiment=None,
 ):
     logger.info("Generating captions for MMU evaluation...")
     model.eval()
@@ -386,11 +357,11 @@ def evaluate_mmu(
     filenames = [
         f"mmu_eval_{i}_step_{global_step}.png" for i in range(len(captioned_images))
     ]
-    log_images_to_mlflow(
-        captioned_images, filenames, "mmu_evaluations", mlflow_client, mlflow_run_id
+    log_images_to_comet(
+        captioned_images, filenames, "mmu_evaluations", comet_experiment
     )
 
-    logger.info(f"MMU evaluation отправлен в MLflow: mmu_evaluations/")
+    logger.info("MMU evaluation logged to Comet: mmu_evaluations/")
 
     for i, (gt, gen) in enumerate(zip(ground_truth_texts, generated_texts)):
         logger.info(f"  Example {i}: GT='{gt[:50]}...' | Gen='{gen[:50]}...'")
@@ -399,7 +370,7 @@ def evaluate_mmu(
 
 
 def log_grad_norm(
-    model, accelerator, global_step, mlflow_client=None, mlflow_run_id=None
+    model, accelerator, global_step, comet_experiment=None
 ):
     import torch
     from collections import defaultdict
@@ -492,10 +463,10 @@ def log_grad_norm(
         for param_name, grad_value in param_dict.items():
             metrics[f"grad_norm/layer_{layer_idx}/{param_name}"] = grad_value
 
-    if mlflow_client is not None and mlflow_run_id is not None:
+    if comet_experiment is not None:
         for metric_name, metric_value in metrics.items():
-            mlflow_client.log_metric(
-                mlflow_run_id, metric_name, metric_value, step=global_step
+            comet_experiment.log_metric(
+                metric_name, metric_value, step=global_step
             )
 
     if hasattr(accelerator, "trackers") and len(accelerator.trackers) > 0:
@@ -537,15 +508,11 @@ def log_training_metrics(
     data_time_m,
     samples_per_second_per_gpu,
     global_step,
-    mlflow_client=None,
-    mlflow_run_id=None,
+    comet_experiment=None,
     logger=None,
 ):
     all_lrs = lr_scheduler.get_last_lr()
 
-    # NOTE: Основные loss-метрики (t2i, lm, mmu, balance, orthogonal) логируются 
-    # централизованно в main loop как усреднённые по gradient accumulation steps.
-    # Здесь логируем только вспомогательные метрики.
     logs = {
         "balance_coeff": balance_coeff,
         "avg_masking_rate": avg_masking_rate.item(),
@@ -563,20 +530,18 @@ def log_training_metrics(
     else:
         logs["lr"] = all_lrs[0]
 
-    if mlflow_client is not None and mlflow_run_id is not None:
+    if comet_experiment is not None:
         try:
             for metric_name, metric_value in logs.items():
-                mlflow_client.log_metric(
-                    mlflow_run_id, metric_name, metric_value, step=global_step
+                comet_experiment.log_metric(
+                    metric_name, metric_value, step=global_step
                 )
-            if logger is not None and global_step <= 400:
-                logger.info(f"✅ Отправлено {len(logs)} вспомогательных метрик в MLflow (step {global_step}, run_id={mlflow_run_id[:8]}...)")
         except Exception as e:
             if logger is not None:
-                logger.error(f"❌ Ошибка отправки метрик в MLflow: {e}", exc_info=True)
+                logger.error(f"Error sending metrics to Comet: {e}", exc_info=True)
     else:
         if logger is not None and global_step <= 400:
-            logger.warning(f"⚠️ MLflow client или run_id отсутствуют: mlflow_client={mlflow_client is not None}, run_id={mlflow_run_id is not None}")
+            logger.warning("Comet experiment is None, metrics not logged")
 
     if logger is not None:
         if len(all_lrs) >= 4:
@@ -608,8 +573,7 @@ def collect_and_log_moe_activations(
     batch_size_lm,
     batch_size_mmu,
     global_step,
-    mlflow_client=None,
-    mlflow_run_id=None,
+    comet_experiment=None,
 ):
     recorder = LayerOutputRecorder(device=accelerator.device)
     unwrapped_model = accelerator.unwrap_model(model)

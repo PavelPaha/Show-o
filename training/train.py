@@ -13,8 +13,6 @@ from typing import Union
 from utils import get_optimizer
 import gc
 from omegaconf import OmegaConf
-import mlflow
-from mlflow.tracking import MlflowClient
 import torch
 from tqdm import tqdm
 
@@ -29,8 +27,6 @@ from accelerate.utils import (
 )
 
 
-import mlflow
-from mlflow.tracking import MlflowClient
 from models.lr_schedulers import get_scheduler
 import torch.nn as nn
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, ExponentialLR, LambdaLR
@@ -62,7 +58,7 @@ from training.utils import (
     AverageMeter,
 )
 from training.moe_visualization import MoEVisualizer
-from training.moe_mlflow_logger import MoEMLflowLogger
+from training.moe_comet_logger import MoECometLogger
 from training.profiling_context import get_profiling_context_torch
 from training.sample_logger import SampleLogger
 
@@ -148,11 +144,10 @@ def train_step(
     mask_schedule,
     batch_time_m,
     data_time_m,
-    total_batch_size_per_gpu,
-    mlflow_client,
-    mlflow_run_id,
-    pbar,
-    sample_logger=None,
+        total_batch_size_per_gpu,
+        comet_experiment,
+        pbar,
+        sample_logger=None,
 ):
     batch_size_t2i = batch["t2i_flow"]["images"].shape[0]
     # Проверяем, есть ли данные LM (может быть пустым, если batch_size_lm=0)
@@ -593,12 +588,11 @@ def train_step(
 
     # MoE losses/coeff only if MoE enabled
     if config.get("moe", {}).get("enabled", False):
-    balance_loss, orthogonal_loss, num_moe_layers = collect_moe_balance_losses(model)
-    if num_moe_layers == 0:
-        logger.warning(f"⚠️ MoE enabled but num_moe_layers = {num_moe_layers}")
-            # Не логируем, если MoE фактически нет
+        balance_loss, orthogonal_loss, num_moe_layers = collect_moe_balance_losses(model)
+        if num_moe_layers == 0:
+            logger.warning(f"MoE enabled but num_moe_layers = {num_moe_layers}")
             should_log_layer_expert = False
-    balance_coeff = balance_scheduler.get_last_lr()[0]
+        balance_coeff = balance_scheduler.get_last_lr()[0]
     else:
         # MoE выключен — ставим нули и не логируем
         zero = loss_t2i.new_tensor(0.0)
@@ -610,10 +604,8 @@ def train_step(
     if (
         should_log_layer_expert
         and accelerator.is_main_process
-        and mlflow_client is not None
-        and mlflow_run_id is not None
+        and comet_experiment is not None
     ):
-        # Сбор статистики в отдельном блоке для освобождения памяти
         unwrapped_model = accelerator.unwrap_model(model)
         collector = LayerExpertStatsCollector(unwrapped_model)
         layer_expert_counts_by_modality, probability_map = collector.collect(global_step)
@@ -621,27 +613,25 @@ def train_step(
         if not layer_expert_counts_by_modality:
             raise Exception("No moe layers")
         visualizer = MoEVisualizer(num_experts=config.moe.num_experts)
-        mlflow_logger = MoEMLflowLogger(mlflow_client=mlflow_client, mlflow_run_id=mlflow_run_id)
+        comet_logger = MoECometLogger(comet_experiment=comet_experiment)
         
         for modality, layer_expert_counts in layer_expert_counts_by_modality.items():
             heatmap_bytes = visualizer.create_layer_expert_activation_heatmap(
                 layer_expert_counts, global_step=global_step + 1
             )
-            mlflow_logger.log_layer_expert_heatmap(global_step + 1, heatmap_bytes, suffix=modality)
+            comet_logger.log_layer_expert_heatmap(global_step + 1, heatmap_bytes, suffix=modality)
             del heatmap_bytes
 
         for modality, layer_probabilities in probability_map.items():
             prob_heatmap = visualizer.create_layer_probability_heatmap(
                 layer_probabilities, modality, global_step
             )
-            mlflow_logger.log_layer_probability_heatmap(
+            comet_logger.log_layer_probability_heatmap(
                 global_step + 1, prob_heatmap, suffix=modality
             )
             del prob_heatmap
         
-        
-        # Явно освобождаем объекты и GPU память
-        del layer_expert_counts_by_modality, probability_map, collector, visualizer, mlflow_logger
+        del layer_expert_counts_by_modality, probability_map, collector, visualizer, comet_logger
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         
@@ -738,7 +728,7 @@ def train_step(
         and (global_step + 1) % config.experiment.log_grad_norm_every == 0
         and accelerator.is_main_process
     ):
-        log_grad_norm(model, accelerator, global_step + 1, mlflow_client, mlflow_run_id)
+        log_grad_norm(model, accelerator, global_step + 1, comet_experiment)
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -766,17 +756,16 @@ def train_step(
             data_time_m=data_time_m,
             samples_per_second_per_gpu=samples_per_second_per_gpu,
             global_step=global_step + 1,
-            mlflow_client=mlflow_client,
-            mlflow_run_id=mlflow_run_id,
+            comet_experiment=comet_experiment,
             logger=logger,
         )
 
-        if mlflow_client is not None and mlflow_run_id is not None and config.get("moe", {}).get("enabled", False):
+        if comet_experiment is not None and config.get("moe", {}).get("enabled", False):
             temperature = float(temp_scheduler.get_last_lr()[0])
-            mlflow_client.log_metric(mlflow_run_id, "moe/temperature", temperature, step=global_step + 1)
+            comet_experiment.log_metric("moe/temperature", temperature, step=global_step + 1)
             logger.info(f"[moe] temperature: {temperature:.4f}")
             
-            mlflow_client.log_metric(mlflow_run_id, "moe/balance_coeff", float(balance_coeff), step=global_step + 1)
+            comet_experiment.log_metric("moe/balance_coeff", float(balance_coeff), step=global_step + 1)
             logger.info(f"[moe] balance_coeff: {float(balance_coeff):.6f}")
             
             unwrapped_model = accelerator.unwrap_model(model)
@@ -785,7 +774,7 @@ def train_step(
                 if hasattr(layer, "mlp") and hasattr(layer.mlp, "get_domain_bias_hardness"):
                     domain_bias_hardness = layer.mlp.get_domain_bias_hardness()
                     break
-            mlflow_client.log_metric(mlflow_run_id, "moe/domain_bias_hardness", domain_bias_hardness, step=global_step + 1)
+            comet_experiment.log_metric("moe/domain_bias_hardness", domain_bias_hardness, step=global_step + 1)
             logger.info(f"[moe] domain_bias_hardness: {domain_bias_hardness:.4f}")
 
         # Reset time meters
@@ -920,7 +909,6 @@ def main():
     accelerator = Accelerator(
         gradient_accumulation_steps=config.training.gradient_accumulation_steps,
         mixed_precision=config.training.mixed_precision,
-        log_with="mlflow",
         project_dir=config.experiment.logging_dir,
         split_batches=True,
         kwargs_handlers=[ddp_kwargs],
@@ -961,57 +949,45 @@ def main():
     else:
         set_verbosity_error()
 
-    mlflow_client = None
-    mlflow_run_id = None
-    if accelerator.is_main_process and config.get("mlflow", {}).get("enabled", False):
-        mlflow_tracking_uri = config.mlflow.get("tracking_uri", "file:./mlruns")
-        mlflow.set_tracking_uri(mlflow_tracking_uri)
-        mlflow_client = MlflowClient(tracking_uri=mlflow_tracking_uri)
-        experiment_name = config.mlflow.get(
-            "experiment_name", config.experiment.project
-        )
-        try:
-            experiment = mlflow_client.get_experiment_by_name(experiment_name)
-            if experiment is None:
-                experiment_id = mlflow_client.create_experiment(experiment_name)
-            else:
-                experiment_id = experiment.experiment_id
-        except:
-            experiment_id = mlflow_client.create_experiment(experiment_name)
+    comet_experiment = None
+    if accelerator.is_main_process and config.get("comet", {}).get("enabled", False):
+        import comet_ml
 
-        run = mlflow_client.create_run(
-            experiment_id=experiment_id,
-            run_name=config.experiment.name,
-            tags=config.mlflow.get("tags", {}),
-        )
-        mlflow_run_id = run.info.run_id
+        comet_cfg = config.comet
+        api_key = comet_cfg.get("api_key", None) or os.environ.get("COMET_API_KEY", None)
+        workspace = comet_cfg.get("workspace", None) or os.environ.get("COMET_WORKSPACE", None)
+        project_name = comet_cfg.get("project_name", config.experiment.project)
 
-        mlflow_client.log_param(
-            mlflow_run_id, "batch_size_mmu", config.training.get("batch_size_mmu", 0)
-        )
-        mlflow_client.log_param(
-            mlflow_run_id, "batch_size_t2i", config.training.batch_size_t2i
-        )
-        mlflow_client.log_param(
-            mlflow_run_id, "batch_size_lm", config.training.get("batch_size_lm", 0)
-        )
-        mlflow_client.log_param(
-            mlflow_run_id, "learning_rate", config.optimizer.params.learning_rate
-        )
-        mlflow_client.log_param(
-            mlflow_run_id, "num_experts", config.moe.get("num_experts", 4)
-        )
-        mlflow_client.log_param(mlflow_run_id, "top_k", config.moe.get("top_k", 2))
-        mlflow_client.log_param(
-            mlflow_run_id, "max_train_steps", config.training.max_train_steps
-        )
-        mlflow_client.log_param(
-            mlflow_run_id,
-            "gradient_accumulation_steps",
-            config.training.gradient_accumulation_steps,
-        )
+        if comet_cfg.get("offline", False):
+            offline_dir = comet_cfg.get("offline_directory", "./comet_offline")
+            comet_experiment = comet_ml.OfflineExperiment(
+                project_name=project_name,
+                offline_directory=offline_dir,
+            )
+        else:
+            comet_experiment = comet_ml.Experiment(
+                api_key=api_key,
+                workspace=workspace,
+                project_name=project_name,
+            )
 
-        logger.info(f"✅ MLflow run started: {mlflow_run_id}")
+        exp_name = comet_cfg.get("experiment_name", None) or config.experiment.name
+        comet_experiment.set_name(exp_name)
+
+        tags = comet_cfg.get("tags", {})
+        if tags:
+            comet_experiment.add_tags(list(tags.values()) if isinstance(tags, dict) else tags)
+
+        comet_experiment.log_parameter("batch_size_mmu", config.training.get("batch_size_mmu", 0))
+        comet_experiment.log_parameter("batch_size_t2i", config.training.batch_size_t2i)
+        comet_experiment.log_parameter("batch_size_lm", config.training.get("batch_size_lm", 0))
+        comet_experiment.log_parameter("learning_rate", config.optimizer.params.learning_rate)
+        comet_experiment.log_parameter("num_experts", config.moe.get("num_experts", 4))
+        comet_experiment.log_parameter("top_k", config.moe.get("top_k", 2))
+        comet_experiment.log_parameter("max_train_steps", config.training.max_train_steps)
+        comet_experiment.log_parameter("gradient_accumulation_steps", config.training.gradient_accumulation_steps)
+
+        logger.info(f"Comet experiment started: {comet_experiment.get_key()}")
 
     if accelerator.is_main_process:
         os.makedirs(config.experiment.output_dir, exist_ok=True)
@@ -1019,13 +995,12 @@ def main():
         logging.info(f"Saving config to {config_path}")
         OmegaConf.save(config, config_path)
         
-        # Сохраняем конфиг в MLflow как артефакт
-        if mlflow_client is not None and mlflow_run_id is not None:
+        if comet_experiment is not None:
             try:
-                mlflow_client.log_artifact(mlflow_run_id, str(config_path))
-                logger.info(f"📄 Config saved to MLflow as artifact: config.yaml")
+                comet_experiment.log_asset(str(config_path), file_name="config.yaml")
+                logger.info("Config saved to Comet as asset: config.yaml")
             except Exception as e:
-                logger.warning(f"Failed to save config to MLflow: {e}")
+                logger.warning(f"Failed to save config to Comet: {e}")
 
     # Seed уже установлен выше, перед инициализацией Accelerator
     # Это гарантирует детерминированность всей инициализации
@@ -1130,8 +1105,7 @@ def main():
         model = patch_model_with_moe(
             model,
             config.moe,
-            mlflow_client=mlflow_client,
-            mlflow_run_id=mlflow_run_id,
+            comet_experiment=comet_experiment,
             special_tokens=special_tokens
         )
         logger.info("✅ MoE patching enabled")
@@ -1365,8 +1339,7 @@ def main():
                         batch_time_m=batch_time_m,
                         data_time_m=data_time_m,
                         total_batch_size_per_gpu=total_batch_size_per_gpu,
-                        mlflow_client=mlflow_client,
-                        mlflow_run_id=mlflow_run_id,
+                        comet_experiment=comet_experiment,
                         pbar=pbar,
                         sample_logger=sample_logger,
                     )
@@ -1420,15 +1393,14 @@ def main():
                                 f"expected={expected_accumulation}. Это может указывать на проблему с gradient accumulation."
                             )
                         
-                        # Логируем усреднённые значения в MLflow
-                        if mlflow_client is not None and mlflow_run_id is not None:
+                        if comet_experiment is not None:
                             try:
-                                mlflow_client.log_metric(mlflow_run_id, "loss/t2i", mean_loss_t2i, step=global_step + 1)
-                                mlflow_client.log_metric(mlflow_run_id, "loss/lm", mean_loss_lm, step=global_step + 1)
-                                mlflow_client.log_metric(mlflow_run_id, "loss/mmu", mean_loss_mmu, step=global_step + 1)
-                                mlflow_client.log_metric(mlflow_run_id, "loss/balance", mean_balance_loss, step=global_step + 1)
-                                mlflow_client.log_metric(mlflow_run_id, "loss/orthogonal", mean_orthogonal_loss, step=global_step + 1)
-                                mlflow_client.log_metric(mlflow_run_id, "masking_rate", mean_masking_rate, step=global_step + 1)
+                                comet_experiment.log_metric("loss/t2i", mean_loss_t2i, step=global_step + 1)
+                                comet_experiment.log_metric("loss/lm", mean_loss_lm, step=global_step + 1)
+                                comet_experiment.log_metric("loss/mmu", mean_loss_mmu, step=global_step + 1)
+                                comet_experiment.log_metric("loss/balance", mean_balance_loss, step=global_step + 1)
+                                comet_experiment.log_metric("loss/orthogonal", mean_orthogonal_loss, step=global_step + 1)
+                                comet_experiment.log_metric("masking_rate", mean_masking_rate, step=global_step + 1)
                             except Exception as e:
                                 logger.warning(f"Failed to log accumulated losses: {e}")
                         
@@ -1465,8 +1437,7 @@ def main():
                                 batch_size_lm=batch_size_lm,
                                 batch_size_mmu=batch_size_mmu,
                                 global_step=global_step + 1,
-                                mlflow_client=mlflow_client,
-                                mlflow_run_id=mlflow_run_id,
+                                comet_experiment=comet_experiment,
                             )
                         # Синхронизируем все процессы после сбора статистики
                         accelerator.wait_for_everyone()
@@ -1485,8 +1456,7 @@ def main():
                             config,
                             global_step + 1,
                             mask_schedule=mask_schedule,
-                            mlflow_client=mlflow_client,
-                            mlflow_run_id=mlflow_run_id,
+                            comet_experiment=comet_experiment,
                         )
 
                         visualize_predictions(
@@ -1500,8 +1470,7 @@ def main():
                             batch["t2i_flow"]["images"],
                             texts,
                             logits,
-                            mlflow_client=mlflow_client,
-                            mlflow_run_id=mlflow_run_id,
+                            comet_experiment=comet_experiment,
                         )
 
                         import gc
@@ -1517,8 +1486,7 @@ def main():
                         #         config,
                         #         global_step + 1,
                         #         batch["mmu_flow"],
-                        #         mlflow_client=mlflow_client,
-                        #         mlflow_run_id=mlflow_run_id,
+                        #         comet_experiment=comet_experiment,
                         #     )
 
                     should_eval_metrics = (global_step % metric_interval == 0)
@@ -1536,44 +1504,41 @@ def main():
                         unwrapped_model = accelerator.unwrap_model(model)
                         mask_token_id = unwrapped_model.config.mask_token_id
                         
-                        # Весь бенчмарк в no_grad для экономии памяти
                         with torch.no_grad():
-                            # Бенчмарк только на rank 0 (torch_fidelity не поддерживает distributed)
                             if accelerator.is_main_process:
-                        benchmark = ShowoBenchmark(
-                            config=config,
-                            coco_dataset=coco_eval_dataset,
-                            model=unwrapped_model,
-                            vq_model=vq_model,
-                            mask_token_id=mask_token_id,
-                            device=device,
-                            save_comparisons=False,
-                        )
-                        
-                        subset_size = config.evaluation.coco['subset_size']
-                        seed = config.evaluation.coco['seed']
-                        
+                                benchmark = ShowoBenchmark(
+                                    config=config,
+                                    coco_dataset=coco_eval_dataset,
+                                    model=unwrapped_model,
+                                    vq_model=vq_model,
+                                    mask_token_id=mask_token_id,
+                                    device=device,
+                                    save_comparisons=False,
+                                )
+
+                                subset_size = config.evaluation.coco['subset_size']
+                                seed = config.evaluation.coco['seed']
+
                                 print(f'Starting FID benchmark with {subset_size} samples...')
                                 fid_score = benchmark.run_subset(subset_size=subset_size, seed=seed)
 
                                 if fid_score is not None:
                                     print(f'Benchmark finished, FID: {fid_score:.4f}')
-                            mlflow_client.log_metric(
-                                mlflow_run_id,
-                                "metrics/fid_coco",
-                                        fid_score,
-                                step=step_plus_one,
-                            )
+                                    if comet_experiment is not None:
+                                        comet_experiment.log_metric(
+                                            "metrics/fid_coco",
+                                            fid_score,
+                                            step=step_plus_one,
+                                        )
                                 else:
                                     print('Benchmark returned None (skip_compute=True?)')
-                                
-                                # Очистка памяти
+
                                 benchmark.model = None
                                 benchmark.vq_model = None
                                 benchmark.tokenizer = None
                                 benchmark.uni_prompting = None
-                        del benchmark
-                            
+                                del benchmark
+
                             accelerator.wait_for_everyone()
                         
                         # Возвращаем модель в train mode
@@ -1604,14 +1569,12 @@ def main():
     # Save final checkpoint (отключено)
     # save_checkpoint(model, config, accelerator, global_step)
 
-    # Завершаем MLflow run только если обучение действительно завершилось (достигнут max_train_steps)
-    if mlflow_client is not None and mlflow_run_id is not None:
+    if comet_experiment is not None:
         if global_step >= config.training.max_train_steps:
-            mlflow_client.set_terminated(mlflow_run_id, status="FINISHED")
-            logger.info(f"MLflow run finished: достигнут лимит шагов {global_step} >= {config.training.max_train_steps}")
+            comet_experiment.end()
+            logger.info(f"Comet experiment ended: reached step limit {global_step} >= {config.training.max_train_steps}")
         else:
-            logger.info(f"MLflow run продолжается: шаг {global_step} < {config.training.max_train_steps}")
-            # НЕ завершаем run, если обучение не закончилось
+            logger.info(f"Comet experiment continues: step {global_step} < {config.training.max_train_steps}")
 
     # Save final model (отключено)
     # if accelerator.is_main_process:

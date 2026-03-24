@@ -2,15 +2,14 @@
 from typing import Optional
 import re
 from moe import MoE
-from moe_mlflow_logger import MoEMLflowLogger
+from moe_comet_logger import MoECometLogger
 from moe_visualization import MoEVisualizer
 
 
 def patch_model_with_moe(
     model,
     moe_config,
-    mlflow_client,
-    mlflow_run_id,
+    comet_experiment=None,
     special_tokens=None,
 ):
     count_layers_to_patch = moe_config["count_layers_to_patch"]
@@ -58,13 +57,13 @@ def patch_model_with_moe(
             print(f"  → Слой {layer_idx}")
             patched_layers.append(layer_idx)
             original_mlp = layer.mlp
-            mlflow_logger = MoEMLflowLogger(mlflow_client=mlflow_client, mlflow_run_id=mlflow_run_id)
+            comet_logger = MoECometLogger(comet_experiment=comet_experiment)
             visualizer = MoEVisualizer(num_experts=num_experts, layer_id=layer_idx)
             moe_layer = MoE(
                 config=config_phi,
                 moe_config=moe_config,
                 template_mlp=original_mlp,
-                mlflow_logger=mlflow_logger,
+                comet_logger=comet_logger,
                 visualizer=visualizer,
                 layer_idx=layer_idx,
                 special_tokens=special_tokens

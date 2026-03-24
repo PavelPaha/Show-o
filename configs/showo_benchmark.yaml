@@ -1,7 +1,11 @@
-mlflow:
+comet:
     enabled: false
-    tracking_uri: "file:./mlruns"
-    experiment_name: "benchmark"
+    api_key: null
+    workspace: null
+    project_name: "benchmark"
+    experiment_name: null
+    offline: false
+    offline_directory: "./comet_offline"
     tags:
         model: "show-o"
         task: "benchmark"
